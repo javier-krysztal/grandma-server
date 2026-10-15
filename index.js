@@ -9,7 +9,7 @@ const { createClient } = require('@supabase/supabase-js');
 
 const COLLECTION_ID = 'grandma-app';
 const MATCH_CONFIDENCE = 80;
-const RATE_LIMIT_MAX = 20;
+const RATE_LIMIT_MAX = 200;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
 const {
