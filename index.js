@@ -189,7 +189,7 @@ app.post('/check-photo', async (req, res) => {
         .searchFacesByImage({
           CollectionId: COLLECTION_ID,
           Image: { Bytes: bytes },
-          FaceMatchThreshold: MATCH_CONFIDENCE,
+          FaceMatchThreshold: 70,
           MaxFaces: 5,
         })
         .promise();
