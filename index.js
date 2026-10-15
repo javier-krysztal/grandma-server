@@ -232,7 +232,7 @@ app.post('/check-photo', async (req, res) => {
 
     if (family?.grandma_phone) {
       const childName = family.child_name || 'Your grandchild';
-      await twilioClient.messages.create({
+      console.log("Sending WhatsApp to:", toWhatsApp(family.grandma_phone), "from:", toWhatsApp(TWILIO_WHATSAPP_FROM)); await twilioClient.messages.create({
         from: toWhatsApp(TWILIO_WHATSAPP_FROM),
         to: toWhatsApp(family.grandma_phone),
         body: `New photo of ${childName} 📸`,
@@ -326,7 +326,7 @@ app.post('/grandma-heart', async (req, res) => {
     const parentPhone = family.parent_id;
     const childName = family.child_name || 'Your child';
 
-    await twilioClient.messages.create({
+    console.log("Sending WhatsApp to:", toWhatsApp(family.grandma_phone), "from:", toWhatsApp(TWILIO_WHATSAPP_FROM)); await twilioClient.messages.create({
       from: toWhatsApp(TWILIO_WHATSAPP_FROM),
       to: toWhatsApp(parentPhone),
       body: `${childName}'s savta loved a photo ❤️`,
