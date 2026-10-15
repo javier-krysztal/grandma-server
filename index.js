@@ -235,8 +235,7 @@ app.post('/check-photo', async (req, res) => {
       await twilioClient.messages.create({
         from: toWhatsApp(TWILIO_WHATSAPP_FROM),
         to: toWhatsApp(family.grandma_phone),
-        body: `New photo of ${childName}`,
-        mediaUrl: [mediaUrl],
+        body: `New photo of ${childName} 📸`,
       });
     }
 
