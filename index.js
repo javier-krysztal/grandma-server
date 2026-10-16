@@ -293,11 +293,18 @@ app.get('/grandma-feed/:grandmaCode', async (req, res) => {
       .order('matched_at', { ascending: false });
     if (photosError) throw photosError;
 
-    const feed = (photos || []).map((photo) => ({
-      ...photo,
-      child_name: family.child_name,
-      child_dob: family.child_dob,
-    }));
+    const feed = (photos || []).map((photo) => {
+      const url = photo.photo_url || '';
+      const bucketPrefix = `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/`;
+      const key = url.startsWith(bucketPrefix) ? url.replace(bucketPrefix, '') : url;
+      const signedUrl = signedS3Url(key);
+      return {
+        ...photo,
+        photo_url: signedUrl,
+        child_name: family.child_name,
+        child_dob: family.child_dob,
+      };
+    });
 
     return res.json(feed);
   } catch (err) {
