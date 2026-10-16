@@ -230,14 +230,7 @@ app.post('/check-photo', async (req, res) => {
       .maybeSingle();
     if (familyError) throw familyError;
 
-    if (family?.grandma_phone) {
-      const childName = family.child_name || 'Your grandchild';
-      console.log("Sending WhatsApp to:", toWhatsApp(family.grandma_phone), "from:", toWhatsApp(TWILIO_WHATSAPP_FROM)); await twilioClient.messages.create({
-        from: TWILIO_WHATSAPP_FROM.replace("whatsapp:", ""),
-        to: family.grandma_phone,
-        body: `New photo of ${childName} 📸`,
-      });
-    }
+    // SMS removed from here - fires once on registration only
 
     return res.json({ found: true, photoUrl });
   } catch (err) {
@@ -265,6 +258,19 @@ app.post('/register-family', async (req, res) => {
       { onConflict: 'parent_id' }
     );
     if (error) throw error;
+
+    // Send one-time SMS invite to grandma
+    if (grandmaPhone) {
+      try {
+        await twilioClient.messages.create({
+          from: TWILIO_WHATSAPP_FROM.replace('whatsapp:', ''),
+          to: grandmaPhone,
+          body: `${childName || 'Your grandchild'}'s parent is sharing photos with you through קטן! Download the app and enter code ${grandmaCode} to see the photos.`,
+        });
+      } catch (smsErr) {
+        console.log('SMS invite failed (non-fatal):', smsErr.message);
+      }
+    }
 
     return res.json({ grandmaCode });
   } catch (err) {
