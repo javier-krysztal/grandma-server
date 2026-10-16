@@ -279,6 +279,24 @@ app.post('/register-family', async (req, res) => {
   }
 });
 
+
+app.get("/parent-feed/:parentId", async (req, res) => {
+  try {
+    const { parentId } = req.params;
+    const { data: photos, error } = await supabase.from("matched_photos").select("id, photo_url, matched_at").eq("parent_id", parentId).order("matched_at", { ascending: false });
+    if (error) throw error;
+    const feed = (photos || []).map((photo) => {
+      const url = photo.photo_url || "";
+      const bucketPrefix = `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/`;
+      const key = url.startsWith(bucketPrefix) ? url.replace(bucketPrefix, "") : url;
+      return { ...photo, photo_url: signedS3Url(key) };
+    });
+    return res.json(feed);
+  } catch (err) {
+    console.error("parent-feed", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
 app.get('/grandma-feed/:grandmaCode', async (req, res) => {
   try {
     const { grandmaCode } = req.params;
