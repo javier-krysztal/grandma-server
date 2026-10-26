@@ -371,6 +371,278 @@ app.post('/grandma-heart', async (req, res) => {
   }
 });
 
+// Teacher mode endpoints
+app.post('/create-class', async (req, res) => {
+  try {
+    const { teacherName, classCode } = req.body;
+    if (!teacherName || !classCode) {
+      return res.status(400).json({ error: 'teacherName and classCode are required' });
+    }
+    if (classCode.length !== 4) {
+      return res.status(400).json({ error: 'classCode must be 4 digits' });
+    }
+
+    const { data, error } = await supabase
+      .from('classes')
+      .insert({ class_code: classCode, teacher_name: teacherName })
+      .select()
+      .single();
+    if (error) throw error;
+
+    return res.json({ success: true, class: data });
+  } catch (err) {
+    console.error('create-class', err);
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to create class' });
+  }
+});
+
+app.post('/teacher-upload', async (req, res) => {
+  try {
+    const { classCode, photo } = req.body;
+    if (!classCode || !photo) {
+      return res.status(400).json({ error: 'classCode and photo are required' });
+    }
+
+    const bytes = decodePhoto(photo);
+    await ensureCollection();
+
+    // Get all families in this class
+    const { data: classMembers, error: membersError } = await supabase
+      .from('class_members')
+      .select('parent_id')
+      .eq('class_code', classCode);
+    if (membersError) throw membersError;
+
+    if (!classMembers || classMembers.length === 0) {
+      return res.json({ matches: 0, totalFaces: 0, message: 'No families in this class yet' });
+    }
+
+    // Run face recognition
+    let search;
+    try {
+      search = await rekognition
+        .searchFacesByImage({
+          CollectionId: COLLECTION_ID,
+          Image: { Bytes: bytes },
+          FaceMatchThreshold: MATCH_CONFIDENCE,
+          MaxFaces: 10,
+        })
+        .promise();
+    } catch (err) {
+      if (err.code === 'InvalidParameterException') {
+        return res.json({ matches: 0, totalFaces: 0 });
+      }
+      throw err;
+    }
+
+    let matches = 0;
+    const parentIdsInClass = new Set(classMembers.map(m => m.parent_id));
+
+    for (const faceMatch of search.FaceMatches || []) {
+      const externalId = faceMatch.Face?.ExternalImageId;
+      if (!externalId) continue;
+
+      // Check if this parent is in the class
+      if (parentIdsInClass.has(externalId)) {
+        const timestamp = Date.now();
+        const key = `teacher-photos/${classCode}/${externalId}/${timestamp}.jpg`;
+        const photoUrl = await uploadJpeg(key, bytes);
+
+        const { error: insertError } = await supabase.from('matched_photos').insert({
+          parent_id: externalId,
+          photo_url: photoUrl,
+          class_code: classCode,
+          matched_at: new Date().toISOString(),
+        });
+        if (insertError) throw insertError;
+
+        matches++;
+      }
+    }
+
+    return res.json({ matches, totalFaces: search.FaceMatches?.length || 0 });
+  } catch (err) {
+    console.error('teacher-upload', err);
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to process teacher upload' });
+  }
+});
+
+// Event mode endpoints
+app.post('/create-event', async (req, res) => {
+  try {
+    const { parentId, eventName, classCode } = req.body;
+    if (!parentId || !eventName || !classCode) {
+      return res.status(400).json({ error: 'parentId, eventName, and classCode are required' });
+    }
+
+    // Generate unique 4-digit event code
+    let eventCode;
+    for (let i = 0; i < 10; i++) {
+      const code = String(crypto.randomInt(0, 10000)).padStart(4, '0');
+      const { data, error } = await supabase
+        .from('events')
+        .select('event_code')
+        .eq('event_code', code)
+        .maybeSingle();
+      if (error) throw error;
+      if (!data) {
+        eventCode = code;
+        break;
+      }
+    }
+    if (!eventCode) {
+      return res.status(500).json({ error: 'Could not generate unique event code' });
+    }
+
+    const { data, error } = await supabase
+      .from('events')
+      .insert({
+        event_code: eventCode,
+        event_name: eventName,
+        class_code: classCode,
+        created_by: parentId,
+      })
+      .select()
+      .single();
+    if (error) throw error;
+
+    return res.json({ success: true, event: data });
+  } catch (err) {
+    console.error('create-event', err);
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to create event' });
+  }
+});
+
+app.post('/event-upload', async (req, res) => {
+  try {
+    const { eventCode, photo, parentId } = req.body;
+    if (!eventCode || !photo || !parentId) {
+      return res.status(400).json({ error: 'eventCode, photo, and parentId are required' });
+    }
+
+    const bytes = decodePhoto(photo);
+    await ensureCollection();
+
+    // Get event details
+    const { data: event, error: eventError } = await supabase
+      .from('events')
+      .select('class_code')
+      .eq('event_code', eventCode)
+      .maybeSingle();
+    if (eventError) throw eventError;
+    if (!event) {
+      return res.status(404).json({ error: 'Event not found' });
+    }
+
+    // Get all families in the class
+    const { data: classMembers, error: membersError } = await supabase
+      .from('class_members')
+      .select('parent_id')
+      .eq('class_code', event.class_code);
+    if (membersError) throw membersError;
+
+    // Upload photo to S3
+    const timestamp = Date.now();
+    const key = `event-photos/${eventCode}/${parentId}/${timestamp}.jpg`;
+    const photoUrl = await uploadJpeg(key, bytes);
+
+    // Run face recognition
+    let search;
+    try {
+      search = await rekognition
+        .searchFacesByImage({
+          CollectionId: COLLECTION_ID,
+          Image: { Bytes: bytes },
+          FaceMatchThreshold: MATCH_CONFIDENCE,
+          MaxFaces: 10,
+        })
+        .promise();
+    } catch (err) {
+      if (err.code === 'InvalidParameterException') {
+        // No faces found, just upload the photo
+        const { error: insertError } = await supabase.from('event_photos').insert({
+          event_code: eventCode,
+          parent_id: parentId,
+          photo_url: photoUrl,
+          matched_parent_id: null,
+          created_at: new Date().toISOString(),
+        });
+        if (insertError) throw insertError;
+        return res.json({ matches: 0, totalFaces: 0 });
+      }
+      throw err;
+    }
+
+    let matches = 0;
+    const parentIdsInClass = new Set(classMembers.map(m => m.parent_id));
+
+    for (const faceMatch of search.FaceMatches || []) {
+      const externalId = faceMatch.Face?.ExternalImageId;
+      if (!externalId) continue;
+
+      // Check if this parent is in the class
+      if (parentIdsInClass.has(externalId)) {
+        const { error: insertError } = await supabase.from('event_photos').insert({
+          event_code: eventCode,
+          parent_id: parentId,
+          photo_url: photoUrl,
+          matched_parent_id: externalId,
+          matched_at: new Date().toISOString(),
+          created_at: new Date().toISOString(),
+        });
+        if (insertError) throw insertError;
+
+        matches++;
+      }
+    }
+
+    // If no matches, still add the photo to the event
+    if (matches === 0) {
+      const { error: insertError } = await supabase.from('event_photos').insert({
+        event_code: eventCode,
+        parent_id: parentId,
+        photo_url: photoUrl,
+        matched_parent_id: null,
+        created_at: new Date().toISOString(),
+      });
+      if (insertError) throw insertError;
+    }
+
+    return res.json({ matches, totalFaces: search.FaceMatches?.length || 0 });
+  } catch (err) {
+    console.error('event-upload', err);
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to process event upload' });
+  }
+});
+
+app.get('/event-feed/:eventCode', async (req, res) => {
+  try {
+    const { eventCode } = req.params;
+
+    const { data: photos, error } = await supabase
+      .from('event_photos')
+      .select('id, parent_id, photo_url, matched_parent_id, matched_at, created_at')
+      .eq('event_code', eventCode)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    const feed = (photos || []).map((photo) => {
+      const url = photo.photo_url || '';
+      const bucketPrefix = `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/`;
+      const key = url.startsWith(bucketPrefix) ? url.replace(bucketPrefix, '') : url;
+      return {
+        ...photo,
+        photo_url: signedS3Url(key),
+      };
+    });
+
+    return res.json(feed);
+  } catch (err) {
+    console.error('event-feed', err);
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to load event feed' });
+  }
+});
+
 app.use((err, req, res, next) => {
   console.error(err);
   res.status(500).json({ error: 'Unexpected error' });
