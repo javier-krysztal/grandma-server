@@ -677,12 +677,23 @@ app.post('/teacher-upload', async (req, res) => {
 });
 
 // Event mode endpoints
+async function ensureClassMember(classCode, parentId) {
+  await supabase.from('classes').upsert({ class_code: classCode, teacher_name: 'Event' }, { onConflict: 'class_code', ignoreDuplicates: true });
+  const { data: family } = await supabase.from('families').select('child_name').eq('parent_id', parentId).maybeSingle();
+  const { data: existing } = await supabase.from('class_members').select('id').eq('class_code', classCode).eq('parent_id', parentId).limit(1);
+  if (!existing || !existing.length) {
+    await supabase.from('class_members').insert({ class_code: classCode, parent_id: parentId, child_name: family?.child_name || '' });
+  }
+}
+
 app.post('/create-event', async (req, res) => {
   try {
     const { parentId, eventName, classCode } = req.body;
     if (!parentId || !eventName || !classCode) {
       return res.status(400).json({ error: 'parentId, eventName, and classCode are required' });
     }
+
+    await ensureClassMember(classCode, parentId);
 
     // Generate unique 4-digit event code
     let eventCode;
@@ -719,6 +730,27 @@ app.post('/create-event', async (req, res) => {
   } catch (err) {
     console.error('create-event', err);
     return res.status(err.status || 500).json({ error: err.message || 'Failed to create event' });
+  }
+});
+
+app.post('/join-event', async (req, res) => {
+  try {
+    const { eventCode, parentId } = req.body;
+    if (!eventCode || !parentId) {
+      return res.status(400).json({ error: 'eventCode and parentId are required' });
+    }
+    const { data: event, error: eventError } = await supabase
+      .from('events')
+      .select('class_code, event_name')
+      .eq('event_code', eventCode)
+      .maybeSingle();
+    if (eventError) throw eventError;
+    if (!event) return res.status(404).json({ error: 'Event not found' });
+    await ensureClassMember(event.class_code, parentId);
+    return res.json({ success: true, eventName: event.event_name, classCode: event.class_code });
+  } catch (err) {
+    console.error('join-event', err);
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to join event' });
   }
 });
 
