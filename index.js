@@ -181,6 +181,7 @@ app.post('/check-photo', async (req, res) => {
     }
 
     const bytes = decodePhoto(photo);
+    console.log(`[check-photo] parentId: ${parentId}, image bytes: ${bytes.length}`);
     await ensureCollection();
 
     let search;
@@ -190,7 +191,7 @@ app.post('/check-photo', async (req, res) => {
           CollectionId: COLLECTION_ID,
           Image: { Bytes: bytes },
           FaceMatchThreshold: 70,
-          MaxFaces: 5,
+          MaxFaces: 4096,
         })
         .promise();
     } catch (err) {
@@ -200,12 +201,20 @@ app.post('/check-photo', async (req, res) => {
       throw err;
     }
 
+    const faceMatches = search.FaceMatches || [];
+    console.log(`[check-photo] FaceMatches returned: ${faceMatches.length}`);
+    faceMatches.slice(0, 10).forEach((m, i) => {
+      console.log(`  [${i}] ExternalImageId: ${m.Face?.ExternalImageId}, Similarity: ${m.Similarity}`);
+    });
+
     const expectedId = rekognitionImageId(parentId);
-    const match = (search.FaceMatches || []).find((m) => {
+    const match = faceMatches.find((m) => {
       const confidence = m.Similarity ?? m.Face?.Confidence ?? 0;
       const externalId = m.Face?.ExternalImageId;
       return confidence >= MATCH_CONFIDENCE && (!externalId || externalId === expectedId);
     });
+
+    console.log(`[check-photo] Expected ExternalImageId: ${expectedId}, match found: ${!!match}`);
 
     if (!match) {
       return res.json({ found: false, photoUrl: null });
