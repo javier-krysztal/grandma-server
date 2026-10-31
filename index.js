@@ -10,6 +10,7 @@ const { createClient } = require('@supabase/supabase-js');
 
 const COLLECTION_ID = 'grandma-app';
 const MATCH_CONFIDENCE = 80;
+const MULTI_CHILD_ENABLED = process.env.MULTI_CHILD_ENABLED === 'true';
 const FACE_MATCH_THRESHOLD = 90;
 const FACE_DETECT_MIN_CONFIDENCE = 90;
 const MAX_CROPPED_FACES = 20;
@@ -199,7 +200,7 @@ async function uniqueGrandmaCode() {
 app.post('/save-reference', async (req, res) => {
   try {
     const { parentId, childId, photo } = req.body;
-    const faceKey = childId || parentId;
+    const faceKey = (MULTI_CHILD_ENABLED && childId) || parentId;
     if (!faceKey) {
       return res.status(400).json({ error: 'childId or parentId is required' });
     }
@@ -227,6 +228,7 @@ app.post('/save-reference', async (req, res) => {
 
 app.post('/register-child', async (req, res) => {
   try {
+    if (!MULTI_CHILD_ENABLED) return res.status(503).json({ error: 'Multi-child not enabled' });
     const { parentId, childName, childDob } = req.body;
     if (!parentId) return res.status(400).json({ error: 'parentId is required' });
     const { data, error } = await supabase
@@ -244,6 +246,7 @@ app.post('/register-child', async (req, res) => {
 
 app.get('/children/:parentId', async (req, res) => {
   try {
+    if (!MULTI_CHILD_ENABLED) return res.json([]);
     const { data, error } = await supabase
       .from('children')
       .select('child_id, child_name, child_dob')
@@ -259,6 +262,7 @@ app.get('/children/:parentId', async (req, res) => {
 
 app.get('/grandma-children/:code', async (req, res) => {
   try {
+    if (!MULTI_CHILD_ENABLED) return res.json([]);
     const { data: family, error: familyError } = await supabase
       .from('families')
       .select('parent_id')
@@ -281,6 +285,9 @@ app.get('/grandma-children/:code', async (req, res) => {
 
 app.post('/migrate-faces', async (req, res) => {
   try {
+    if (!process.env.ADMIN_SECRET || req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     const { data: children, error } = await supabase.from('children').select('child_id, parent_id');
     if (error) throw error;
     let migrated = 0;
@@ -329,13 +336,15 @@ app.post('/check-photo', async (req, res) => {
     }
 
     let children = [];
-    try {
-      const { data: childrenRows } = await supabase
-        .from('children')
-        .select('child_id, child_name')
-        .eq('parent_id', parentId);
-      children = childrenRows || [];
-    } catch (e) { /* children table may not exist yet */ }
+    if (MULTI_CHILD_ENABLED) {
+      try {
+        const { data: childrenRows } = await supabase
+          .from('children')
+          .select('child_id, child_name')
+          .eq('parent_id', parentId);
+        children = childrenRows || [];
+      } catch (e) { /* children table may not exist yet */ }
+    }
     const childIds = new Set(children.map((c) => c.child_id));
     const expectedId = rekognitionImageId(parentId);
 
@@ -359,7 +368,7 @@ app.post('/check-photo', async (req, res) => {
     if (assetId) {
       const { data: existing } = await supabase
         .from('matched_photos')
-        .select('child_id, photo_url')
+        .select('photo_url' + (MULTI_CHILD_ENABLED ? ', child_id' : ''))
         .eq('parent_id', parentId)
         .eq('asset_id', assetId);
       const saved = new Set((existing || []).map((r) => r.child_id));
@@ -381,11 +390,11 @@ app.post('/check-photo', async (req, res) => {
     for (const childId of toSave) {
       const insertData = {
         parent_id: parentId,
-        child_id: childId,
         photo_url: photoUrl,
         taken_at: takenAt ? new Date(takenAt).toISOString() : new Date().toISOString(),
         matched_at: new Date().toISOString(),
       };
+      if (MULTI_CHILD_ENABLED && childId) insertData.child_id = childId;
       if (assetId) insertData.asset_id = assetId;
       const { error: insertError } = await supabase.from('matched_photos').insert(insertData);
       if (insertError) throw insertError;
@@ -455,10 +464,8 @@ app.post('/register-family', async (req, res) => {
 app.get("/parent-feed/:parentId", async (req, res) => {
   try {
     const { parentId } = req.params;
-    let { data: photos, error } = await supabase.from("matched_photos").select("id, photo_url, matched_at, taken_at, event_code, child_id").eq("parent_id", parentId).order("taken_at", { ascending: false, nullsFirst: false });
-    if (error) {
-      ({ data: photos, error } = await supabase.from("matched_photos").select("id, photo_url, matched_at, taken_at, event_code").eq("parent_id", parentId).order("taken_at", { ascending: false, nullsFirst: false }));
-    }
+    const childCol = MULTI_CHILD_ENABLED ? ', child_id' : '';
+    const { data: photos, error } = await supabase.from("matched_photos").select("id, photo_url, matched_at, taken_at, event_code" + childCol).eq("parent_id", parentId).order("taken_at", { ascending: false, nullsFirst: false });
     if (error) throw error;
     const codes = [...new Set((photos || []).map(p => p.event_code).filter(Boolean))];
     const cids = [...new Set((photos || []).map(p => p.child_id).filter(Boolean))];
@@ -467,7 +474,7 @@ app.get("/parent-feed/:parentId", async (req, res) => {
       const { data: evs } = await supabase.from('events').select('event_code, event_name').in('event_code', codes);
       for (const e of evs || []) eventNames[e.event_code] = e.event_name;
     }
-    if (cids.length) {
+    if (MULTI_CHILD_ENABLED && cids.length) {
       const { data: cs } = await supabase.from('children').select('child_id, child_name').in('child_id', cids);
       for (const c of cs || []) childNames[c.child_id] = c.child_name;
     }
@@ -496,18 +503,11 @@ app.get('/grandma-feed/:grandmaCode', async (req, res) => {
       return res.status(404).json({ error: 'Family not found' });
     }
 
-    let { data: photos, error: photosError } = await supabase
+    const { data: photos, error: photosError } = await supabase
       .from('matched_photos')
-      .select('id, parent_id, photo_url, matched_at, taken_at, event_code, child_id')
+      .select('id, parent_id, photo_url, matched_at, taken_at, event_code' + (MULTI_CHILD_ENABLED ? ', child_id' : ''))
       .eq('parent_id', family.parent_id)
       .order('taken_at', { ascending: false, nullsFirst: false });
-    if (photosError) {
-      ({ data: photos, error: photosError } = await supabase
-        .from('matched_photos')
-        .select('id, parent_id, photo_url, matched_at, taken_at, event_code')
-        .eq('parent_id', family.parent_id)
-        .order('taken_at', { ascending: false, nullsFirst: false }));
-    }
     if (photosError) throw photosError;
 
     const codes = [...new Set((photos || []).map(p => p.event_code).filter(Boolean))];
@@ -517,7 +517,7 @@ app.get('/grandma-feed/:grandmaCode', async (req, res) => {
       const { data: evs } = await supabase.from('events').select('event_code, event_name').in('event_code', codes);
       for (const e of evs || []) eventNames[e.event_code] = e.event_name;
     }
-    if (cids.length) {
+    if (MULTI_CHILD_ENABLED && cids.length) {
       const { data: cs } = await supabase.from('children').select('child_id, child_name').in('child_id', cids);
       for (const c of cs || []) childNames[c.child_id] = c.child_name;
     }
@@ -638,7 +638,7 @@ app.post('/teacher-upload', async (req, res) => {
     let matches = 0;
     const parentIdsInClass = new Set(classMembers.map(m => m.parent_id));
     const extIds = matchedExtIds;
-    const { data: childRows } = extIds.length
+    const { data: childRows } = (MULTI_CHILD_ENABLED && extIds.length)
       ? await supabase.from('children').select('child_id, parent_id').in('child_id', extIds)
       : { data: [] };
     const childToParent = {};
@@ -655,13 +655,14 @@ app.post('/teacher-upload', async (req, res) => {
         const key = `teacher-photos/${classCode}/${ownerParentId}/${timestamp}.jpg`;
         const photoUrl = await uploadJpeg(key, bytes);
 
-        const { error: insertError } = await supabase.from('matched_photos').insert({
+        const insertRow = {
           parent_id: ownerParentId,
-          child_id: childId,
           photo_url: photoUrl,
           class_code: classCode,
           matched_at: new Date().toISOString(),
-        });
+        };
+        if (MULTI_CHILD_ENABLED && childId) insertRow.child_id = childId;
+        const { error: insertError } = await supabase.from('matched_photos').insert(insertRow);
         if (insertError) throw insertError;
 
         matches++;
@@ -777,7 +778,7 @@ app.post('/event-upload', async (req, res) => {
     let matches = 0;
     const parentIdsInClass = new Set(classMembers.map(m => m.parent_id));
     const extIds = matchedExtIds;
-    const { data: childRows } = extIds.length
+    const { data: childRows } = (MULTI_CHILD_ENABLED && extIds.length)
       ? await supabase.from('children').select('child_id, parent_id').in('child_id', extIds)
       : { data: [] };
     const childToParent = {};
@@ -800,14 +801,15 @@ app.post('/event-upload', async (req, res) => {
         });
         if (insertError) throw insertError;
 
-        const { error: matchInsertError } = await supabase.from('matched_photos').insert({
+        const matchRow = {
           parent_id: ownerParentId,
-          child_id: childId,
           photo_url: photoUrl,
           event_code: eventCode,
           taken_at: new Date().toISOString(),
           matched_at: new Date().toISOString(),
-        });
+        };
+        if (MULTI_CHILD_ENABLED && childId) matchRow.child_id = childId;
+        const { error: matchInsertError } = await supabase.from('matched_photos').insert(matchRow);
         if (matchInsertError) throw matchInsertError;
 
         matches++;
