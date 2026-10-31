@@ -49,6 +49,11 @@ const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const app = express();
 app.set('trust proxy', true);
 app.use(cors());
+app.use((req, res, next) => {
+  res.setHeader('x-multi-child', MULTI_CHILD_ENABLED ? '1' : '0');
+  res.setHeader('access-control-expose-headers', 'x-multi-child');
+  next();
+});
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json({ limit: '10mb' }));
 
@@ -420,9 +425,18 @@ app.post('/check-photo', async (req, res) => {
   }
 });
 
+const clientLogHits = new Map();
 app.post('/client-log', (req, res) => {
-  const { tag, message, stack, extra, platform } = req.body || {};
-  console.log(`[client-log] ${platform || '?'} ${tag || '?'}: ${message || ''}\n${stack || ''}\n${extra || ''}`);
+  const ip = req.ip || 'unknown';
+  const now = Date.now();
+  let entry = clientLogHits.get(ip);
+  if (!entry || entry.reset < now) {
+    entry = { count: 0, reset: now + RATE_LIMIT_WINDOW_MS };
+    clientLogHits.set(ip, entry);
+  }
+  if (++entry.count > 20) return res.status(429).json({ error: 'rate limited' });
+  const { message, screen, version } = req.body || {};
+  console.log(`[client-log] screen=${String(screen || '').slice(0, 80)} version=${String(version || '').slice(0, 40)} msg=${String(message || '').slice(0, 500)}`);
   return res.json({ ok: true });
 });
 
