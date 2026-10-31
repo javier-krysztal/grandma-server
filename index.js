@@ -420,6 +420,12 @@ app.post('/check-photo', async (req, res) => {
   }
 });
 
+app.post('/client-log', (req, res) => {
+  const { tag, message, stack, extra, platform } = req.body || {};
+  console.log(`[client-log] ${platform || '?'} ${tag || '?'}: ${message || ''}\n${stack || ''}\n${extra || ''}`);
+  return res.json({ ok: true });
+});
+
 app.post('/register-family', async (req, res) => {
   try {
     const { parentId, grandmaPhone, childName, childDob } = req.body;
