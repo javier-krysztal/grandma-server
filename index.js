@@ -175,7 +175,7 @@ app.post('/save-reference', async (req, res) => {
 
 app.post('/check-photo', async (req, res) => {
   try {
-    const { parentId, photo } = req.body;
+    const { parentId, photo, takenAt, assetId } = req.body;
     if (!parentId) {
       return res.status(400).json({ error: 'parentId is required' });
     }
@@ -223,13 +223,18 @@ app.post('/check-photo', async (req, res) => {
     const timestamp = Date.now();
     const key = `matches/${parentId}/${timestamp}.jpg`;
     const photoUrl = await uploadJpeg(key, bytes);
-    const mediaUrl = signedS3Url(key);
 
-    const { error: insertError } = await supabase.from('matched_photos').insert({
+    const insertData = {
       parent_id: parentId,
       photo_url: photoUrl,
+      taken_at: takenAt ? new Date(takenAt).toISOString() : new Date().toISOString(),
       matched_at: new Date().toISOString(),
-    });
+    };
+    if (assetId) insertData.asset_id = assetId;
+
+    const { error: insertError } = await supabase
+      .from('matched_photos')
+      .upsert(insertData, { onConflict: 'parent_id,asset_id', ignoreDuplicates: true });
     if (insertError) throw insertError;
 
     const { data: family, error: familyError } = await supabase
@@ -292,14 +297,20 @@ app.post('/register-family', async (req, res) => {
 app.get("/parent-feed/:parentId", async (req, res) => {
   try {
     const { parentId } = req.params;
-    const { data: photos, error } = await supabase.from("matched_photos").select("id, photo_url, matched_at").eq("parent_id", parentId).order("matched_at", { ascending: false });
+    const { data: photos, error } = await supabase.from("matched_photos").select("id, photo_url, matched_at, taken_at, event_code").eq("parent_id", parentId).order("taken_at", { ascending: false, nullsFirst: false });
     if (error) throw error;
+    const codes = [...new Set((photos || []).map(p => p.event_code).filter(Boolean))];
+    let eventNames = {};
+    if (codes.length) {
+      const { data: evs } = await supabase.from('events').select('event_code, event_name').in('event_code', codes);
+      for (const e of evs || []) eventNames[e.event_code] = e.event_name;
+    }
     const feed = (photos || []).map((photo) => {
       const url = photo.photo_url || "";
       const bucketPrefix = `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/`;
       const key = url.startsWith(bucketPrefix) ? url.replace(bucketPrefix, "") : url;
-      return { ...photo, photo_url: signedS3Url(key) };
-    });
+      return { ...photo, photo_url: signedS3Url(key), taken_at: photo.taken_at || photo.matched_at, event_name: eventNames[photo.event_code] || null };
+    }).sort((a, b) => new Date(b.taken_at || b.matched_at) - new Date(a.taken_at || a.matched_at));
     return res.json(feed);
   } catch (err) {
     console.error("parent-feed", err);
@@ -321,10 +332,17 @@ app.get('/grandma-feed/:grandmaCode', async (req, res) => {
 
     const { data: photos, error: photosError } = await supabase
       .from('matched_photos')
-      .select('id, parent_id, photo_url, matched_at')
+      .select('id, parent_id, photo_url, matched_at, taken_at, event_code')
       .eq('parent_id', family.parent_id)
-      .order('matched_at', { ascending: false });
+      .order('taken_at', { ascending: false, nullsFirst: false });
     if (photosError) throw photosError;
+
+    const codes = [...new Set((photos || []).map(p => p.event_code).filter(Boolean))];
+    let eventNames = {};
+    if (codes.length) {
+      const { data: evs } = await supabase.from('events').select('event_code, event_name').in('event_code', codes);
+      for (const e of evs || []) eventNames[e.event_code] = e.event_name;
+    }
 
     const feed = (photos || []).map((photo) => {
       const url = photo.photo_url || '';
@@ -334,10 +352,12 @@ app.get('/grandma-feed/:grandmaCode', async (req, res) => {
       return {
         ...photo,
         photo_url: signedUrl,
+        taken_at: photo.taken_at || photo.matched_at,
+        event_name: eventNames[photo.event_code] || null,
         child_name: family.child_name,
         child_dob: family.child_dob,
       };
-    });
+    }).sort((a, b) => new Date(b.taken_at || b.matched_at) - new Date(a.taken_at || a.matched_at));
 
     return res.json(feed);
   } catch (err) {
@@ -600,6 +620,15 @@ app.post('/event-upload', async (req, res) => {
           created_at: new Date().toISOString(),
         });
         if (insertError) throw insertError;
+
+        const { error: matchInsertError } = await supabase.from('matched_photos').insert({
+          parent_id: externalId,
+          photo_url: photoUrl,
+          event_code: eventCode,
+          taken_at: new Date().toISOString(),
+          matched_at: new Date().toISOString(),
+        });
+        if (matchInsertError) throw matchInsertError;
 
         matches++;
       }
