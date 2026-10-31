@@ -42,3 +42,7 @@ CREATE INDEX IF NOT EXISTS idx_events_class_code ON events(class_code);
 CREATE INDEX IF NOT EXISTS idx_event_photos_event_code ON event_photos(event_code);
 CREATE INDEX IF NOT EXISTS idx_event_photos_parent_id ON event_photos(parent_id);
 CREATE INDEX IF NOT EXISTS idx_event_photos_matched_parent_id ON event_photos(matched_parent_id);
+
+-- Dedupe camera-roll matches: one row per (parent_id, asset_id).
+-- asset_id is NULL for teacher/event uploads; Postgres allows multiple NULLs.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_matched_photos_parent_asset ON matched_photos(parent_id, asset_id);

@@ -220,6 +220,19 @@ app.post('/check-photo', async (req, res) => {
       return res.json({ found: false, photoUrl: null });
     }
 
+    if (assetId) {
+      const { data: existing } = await supabase
+        .from('matched_photos')
+        .select('photo_url')
+        .eq('parent_id', parentId)
+        .eq('asset_id', assetId)
+        .limit(1);
+      if (existing && existing.length) {
+        console.log(`[check-photo] duplicate assetId ${assetId}, skipping save`);
+        return res.json({ found: true, photoUrl: existing[0].photo_url, duplicate: true });
+      }
+    }
+
     const timestamp = Date.now();
     const key = `matches/${parentId}/${timestamp}.jpg`;
     const photoUrl = await uploadJpeg(key, bytes);
@@ -232,9 +245,7 @@ app.post('/check-photo', async (req, res) => {
     };
     if (assetId) insertData.asset_id = assetId;
 
-    const { error: insertError } = await supabase
-      .from('matched_photos')
-      .upsert(insertData, { onConflict: 'parent_id,asset_id', ignoreDuplicates: true });
+    const { error: insertError } = await supabase.from('matched_photos').insert(insertData);
     if (insertError) throw insertError;
 
     const { data: family, error: familyError } = await supabase
