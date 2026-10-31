@@ -88,6 +88,37 @@ function rekognitionImageId(parentId) {
   return String(parentId).replace(/[^a-zA-Z0-9_.\-:]+/g, '_').slice(0, 255);
 }
 
+async function findMatchingFaces(imageBytes) {
+  const detection = await rekognition
+    .detectFaces({ Image: { Bytes: imageBytes }, Attributes: ['DEFAULT'] })
+    .promise();
+  const faces = (detection.FaceDetails || [])
+    .filter((f) => (f.Confidence ?? 0) >= FACE_DETECT_MIN_CONFIDENCE && f.BoundingBox)
+    .slice(0, MAX_CROPPED_FACES);
+  console.log(`[match] faces detected: ${(detection.FaceDetails || []).length}, faces searched: ${faces.length}`);
+  const ids = new Set();
+  for (const face of faces) {
+    let search;
+    try {
+      const crop = await cropFace(imageBytes, face.BoundingBox);
+      search = await rekognition.searchFacesByImage({
+        CollectionId: COLLECTION_ID,
+        Image: { Bytes: crop },
+        FaceMatchThreshold: FACE_MATCH_THRESHOLD,
+        MaxFaces: 4096,
+      }).promise();
+    } catch (err) {
+      if (err.code === 'InvalidParameterException') continue;
+      throw err;
+    }
+    for (const m of search.FaceMatches || []) {
+      const ext = m.Face?.ExternalImageId;
+      if (ext) ids.add(ext);
+    }
+  }
+  return [...ids];
+}
+
 async function cropFace(imageBytes, boundingBox) {
   const meta = await sharp(imageBytes).metadata();
   const w = meta.width || 1;
@@ -287,22 +318,15 @@ app.post('/check-photo', async (req, res) => {
     console.log(`[check-photo] parentId: ${parentId}, image bytes: ${bytes.length}`);
     await ensureCollection();
 
-    let detection;
+    let matchedExtIds;
     try {
-      detection = await rekognition
-        .detectFaces({ Image: { Bytes: bytes }, Attributes: ['DEFAULT'] })
-        .promise();
+      matchedExtIds = await findMatchingFaces(bytes);
     } catch (err) {
       if (err.code === 'InvalidParameterException') {
         return res.json({ found: false, photoUrl: null });
       }
       throw err;
     }
-    const detected = (detection.FaceDetails || []).length;
-    const faces = (detection.FaceDetails || [])
-      .filter((f) => (f.Confidence ?? 0) >= FACE_DETECT_MIN_CONFIDENCE && f.BoundingBox)
-      .slice(0, MAX_CROPPED_FACES);
-    console.log(`[check-photo] faces detected: ${detected}, faces searched: ${faces.length}`);
 
     let children = [];
     try {
@@ -316,31 +340,11 @@ app.post('/check-photo', async (req, res) => {
     const expectedId = rekognitionImageId(parentId);
 
     const matchedChildIds = [];
-    for (const face of faces) {
-      let search;
-      try {
-        const crop = await cropFace(bytes, face.BoundingBox);
-        search = await rekognition
-          .searchFacesByImage({
-            CollectionId: COLLECTION_ID,
-            Image: { Bytes: crop },
-            FaceMatchThreshold: FACE_MATCH_THRESHOLD,
-            MaxFaces: 4096,
-          })
-          .promise();
-      } catch (err) {
-        if (err.code === 'InvalidParameterException') continue;
-        throw err;
-      }
-      for (const m of search.FaceMatches || []) {
-        const confidence = m.Similarity ?? m.Face?.Confidence ?? 0;
-        const externalId = m.Face?.ExternalImageId;
-        if (confidence < MATCH_CONFIDENCE || !externalId) continue;
-        if (childIds.has(externalId)) {
-          matchedChildIds.push(externalId);
-        } else if (externalId === expectedId) {
-          matchedChildIds.push(children.length ? children[0].child_id : null);
-        }
+    for (const externalId of matchedExtIds) {
+      if (childIds.has(externalId)) {
+        matchedChildIds.push(externalId);
+      } else if (externalId === expectedId) {
+        matchedChildIds.push(children.length ? children[0].child_id : null);
       }
     }
     const uniqueChildren = [...new Set(matchedChildIds)];
@@ -621,16 +625,9 @@ app.post('/teacher-upload', async (req, res) => {
     }
 
     // Run face recognition
-    let search;
+    let matchedExtIds;
     try {
-      search = await rekognition
-        .searchFacesByImage({
-          CollectionId: COLLECTION_ID,
-          Image: { Bytes: bytes },
-          FaceMatchThreshold: MATCH_CONFIDENCE,
-          MaxFaces: 10,
-        })
-        .promise();
+      matchedExtIds = await findMatchingFaces(bytes);
     } catch (err) {
       if (err.code === 'InvalidParameterException') {
         return res.json({ matches: 0, totalFaces: 0 });
@@ -640,15 +637,14 @@ app.post('/teacher-upload', async (req, res) => {
 
     let matches = 0;
     const parentIdsInClass = new Set(classMembers.map(m => m.parent_id));
-    const extIds = [...new Set((search.FaceMatches || []).map(m => m.Face?.ExternalImageId).filter(Boolean))];
+    const extIds = matchedExtIds;
     const { data: childRows } = extIds.length
       ? await supabase.from('children').select('child_id, parent_id').in('child_id', extIds)
       : { data: [] };
     const childToParent = {};
     for (const c of childRows || []) childToParent[c.child_id] = c.parent_id;
 
-    for (const faceMatch of search.FaceMatches || []) {
-      const externalId = faceMatch.Face?.ExternalImageId;
+    for (const externalId of matchedExtIds) {
       if (!externalId) continue;
       const ownerParentId = childToParent[externalId] || externalId;
       const childId = childToParent[externalId] ? externalId : null;
@@ -672,7 +668,7 @@ app.post('/teacher-upload', async (req, res) => {
       }
     }
 
-    return res.json({ matches, totalFaces: search.FaceMatches?.length || 0 });
+    return res.json({ matches, totalFaces: matchedExtIds.length });
   } catch (err) {
     console.error('teacher-upload', err);
     return res.status(err.status || 500).json({ error: err.message || 'Failed to process teacher upload' });
@@ -759,16 +755,9 @@ app.post('/event-upload', async (req, res) => {
     const photoUrl = await uploadJpeg(key, bytes);
 
     // Run face recognition
-    let search;
+    let matchedExtIds;
     try {
-      search = await rekognition
-        .searchFacesByImage({
-          CollectionId: COLLECTION_ID,
-          Image: { Bytes: bytes },
-          FaceMatchThreshold: MATCH_CONFIDENCE,
-          MaxFaces: 10,
-        })
-        .promise();
+      matchedExtIds = await findMatchingFaces(bytes);
     } catch (err) {
       if (err.code === 'InvalidParameterException') {
         // No faces found, just upload the photo
@@ -787,15 +776,14 @@ app.post('/event-upload', async (req, res) => {
 
     let matches = 0;
     const parentIdsInClass = new Set(classMembers.map(m => m.parent_id));
-    const extIds = [...new Set((search.FaceMatches || []).map(m => m.Face?.ExternalImageId).filter(Boolean))];
+    const extIds = matchedExtIds;
     const { data: childRows } = extIds.length
       ? await supabase.from('children').select('child_id, parent_id').in('child_id', extIds)
       : { data: [] };
     const childToParent = {};
     for (const c of childRows || []) childToParent[c.child_id] = c.parent_id;
 
-    for (const faceMatch of search.FaceMatches || []) {
-      const externalId = faceMatch.Face?.ExternalImageId;
+    for (const externalId of matchedExtIds) {
       if (!externalId) continue;
       const ownerParentId = childToParent[externalId] || externalId;
       const childId = childToParent[externalId] ? externalId : null;
@@ -838,7 +826,7 @@ app.post('/event-upload', async (req, res) => {
       if (insertError) throw insertError;
     }
 
-    return res.json({ matches, totalFaces: search.FaceMatches?.length || 0 });
+    return res.json({ matches, totalFaces: matchedExtIds.length });
   } catch (err) {
     console.error('event-upload', err);
     return res.status(err.status || 500).json({ error: err.message || 'Failed to process event upload' });
