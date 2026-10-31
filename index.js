@@ -5,10 +5,16 @@ const express = require('express');
 const cors = require('cors');
 const AWS = require('aws-sdk');
 const twilio = require('twilio');
+const sharp = require('sharp');
 const { createClient } = require('@supabase/supabase-js');
 
 const COLLECTION_ID = 'grandma-app';
 const MATCH_CONFIDENCE = 80;
+const FACE_MATCH_THRESHOLD = 90;
+const FACE_DETECT_MIN_CONFIDENCE = 90;
+const MAX_CROPPED_FACES = 20;
+const CROP_MARGIN_RATIO = 0.25;
+const CROP_MIN_SIZE = 160;
 const RATE_LIMIT_MAX = 200;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
@@ -80,6 +86,20 @@ function decodePhoto(photo) {
 
 function rekognitionImageId(parentId) {
   return String(parentId).replace(/[^a-zA-Z0-9_.\-:]+/g, '_').slice(0, 255);
+}
+
+async function cropFace(imageBytes, boundingBox) {
+  const meta = await sharp(imageBytes).metadata();
+  const w = meta.width || 1;
+  const h = meta.height || 1;
+  const m = CROP_MARGIN_RATIO;
+  const left = Math.max(0, Math.floor((boundingBox.Left - boundingBox.Width * m) * w));
+  const top = Math.max(0, Math.floor((boundingBox.Top - boundingBox.Height * m) * h));
+  const width = Math.min(w - left, Math.ceil(boundingBox.Width * (1 + 2 * m) * w));
+  const height = Math.min(h - top, Math.ceil(boundingBox.Height * (1 + 2 * m) * h));
+  let img = sharp(imageBytes).extract({ left, top, width: Math.max(1, width), height: Math.max(1, height) });
+  if (width < CROP_MIN_SIZE) img = img.resize({ width: CROP_MIN_SIZE });
+  return img.jpeg().toBuffer();
 }
 
 function toWhatsApp(phone) {
@@ -267,15 +287,10 @@ app.post('/check-photo', async (req, res) => {
     console.log(`[check-photo] parentId: ${parentId}, image bytes: ${bytes.length}`);
     await ensureCollection();
 
-    let search;
+    let detection;
     try {
-      search = await rekognition
-        .searchFacesByImage({
-          CollectionId: COLLECTION_ID,
-          Image: { Bytes: bytes },
-          FaceMatchThreshold: 70,
-          MaxFaces: 4096,
-        })
+      detection = await rekognition
+        .detectFaces({ Image: { Bytes: bytes }, Attributes: ['DEFAULT'] })
         .promise();
     } catch (err) {
       if (err.code === 'InvalidParameterException') {
@@ -283,34 +298,53 @@ app.post('/check-photo', async (req, res) => {
       }
       throw err;
     }
+    const detected = (detection.FaceDetails || []).length;
+    const faces = (detection.FaceDetails || [])
+      .filter((f) => (f.Confidence ?? 0) >= FACE_DETECT_MIN_CONFIDENCE && f.BoundingBox)
+      .slice(0, MAX_CROPPED_FACES);
+    console.log(`[check-photo] faces detected: ${detected}, faces searched: ${faces.length}`);
 
-    const faceMatches = search.FaceMatches || [];
-    console.log(`[check-photo] FaceMatches returned: ${faceMatches.length}`);
-    faceMatches.slice(0, 10).forEach((m, i) => {
-      console.log(`  [${i}] ExternalImageId: ${m.Face?.ExternalImageId}, Similarity: ${m.Similarity}`);
-    });
-
-    const { data: childrenRows } = await supabase
-      .from('children')
-      .select('child_id, child_name')
-      .eq('parent_id', parentId);
-    const children = childrenRows || [];
+    let children = [];
+    try {
+      const { data: childrenRows } = await supabase
+        .from('children')
+        .select('child_id, child_name')
+        .eq('parent_id', parentId);
+      children = childrenRows || [];
+    } catch (e) { /* children table may not exist yet */ }
     const childIds = new Set(children.map((c) => c.child_id));
     const expectedId = rekognitionImageId(parentId);
 
     const matchedChildIds = [];
-    for (const m of faceMatches) {
-      const confidence = m.Similarity ?? m.Face?.Confidence ?? 0;
-      const externalId = m.Face?.ExternalImageId;
-      if (confidence < MATCH_CONFIDENCE || !externalId) continue;
-      if (childIds.has(externalId)) {
-        matchedChildIds.push(externalId);
-      } else if (externalId === expectedId) {
-        matchedChildIds.push(children.length ? children[0].child_id : null);
+    for (const face of faces) {
+      let search;
+      try {
+        const crop = await cropFace(bytes, face.BoundingBox);
+        search = await rekognition
+          .searchFacesByImage({
+            CollectionId: COLLECTION_ID,
+            Image: { Bytes: crop },
+            FaceMatchThreshold: FACE_MATCH_THRESHOLD,
+            MaxFaces: 4096,
+          })
+          .promise();
+      } catch (err) {
+        if (err.code === 'InvalidParameterException') continue;
+        throw err;
+      }
+      for (const m of search.FaceMatches || []) {
+        const confidence = m.Similarity ?? m.Face?.Confidence ?? 0;
+        const externalId = m.Face?.ExternalImageId;
+        if (confidence < MATCH_CONFIDENCE || !externalId) continue;
+        if (childIds.has(externalId)) {
+          matchedChildIds.push(externalId);
+        } else if (externalId === expectedId) {
+          matchedChildIds.push(children.length ? children[0].child_id : null);
+        }
       }
     }
     const uniqueChildren = [...new Set(matchedChildIds)];
-    console.log(`[check-photo] children matched: ${uniqueChildren.length}`);
+    console.log(`[check-photo] expected account ${expectedId} matched: ${uniqueChildren.length > 0} (${uniqueChildren.length} children)`);
 
     if (!uniqueChildren.length) {
       return res.json({ found: false, photoUrl: null, matchedChildren: [] });
@@ -417,7 +451,10 @@ app.post('/register-family', async (req, res) => {
 app.get("/parent-feed/:parentId", async (req, res) => {
   try {
     const { parentId } = req.params;
-    const { data: photos, error } = await supabase.from("matched_photos").select("id, photo_url, matched_at, taken_at, event_code, child_id").eq("parent_id", parentId).order("taken_at", { ascending: false, nullsFirst: false });
+    let { data: photos, error } = await supabase.from("matched_photos").select("id, photo_url, matched_at, taken_at, event_code, child_id").eq("parent_id", parentId).order("taken_at", { ascending: false, nullsFirst: false });
+    if (error) {
+      ({ data: photos, error } = await supabase.from("matched_photos").select("id, photo_url, matched_at, taken_at, event_code").eq("parent_id", parentId).order("taken_at", { ascending: false, nullsFirst: false }));
+    }
     if (error) throw error;
     const codes = [...new Set((photos || []).map(p => p.event_code).filter(Boolean))];
     const cids = [...new Set((photos || []).map(p => p.child_id).filter(Boolean))];
@@ -455,11 +492,18 @@ app.get('/grandma-feed/:grandmaCode', async (req, res) => {
       return res.status(404).json({ error: 'Family not found' });
     }
 
-    const { data: photos, error: photosError } = await supabase
+    let { data: photos, error: photosError } = await supabase
       .from('matched_photos')
       .select('id, parent_id, photo_url, matched_at, taken_at, event_code, child_id')
       .eq('parent_id', family.parent_id)
       .order('taken_at', { ascending: false, nullsFirst: false });
+    if (photosError) {
+      ({ data: photos, error: photosError } = await supabase
+        .from('matched_photos')
+        .select('id, parent_id, photo_url, matched_at, taken_at, event_code')
+        .eq('parent_id', family.parent_id)
+        .order('taken_at', { ascending: false, nullsFirst: false }));
+    }
     if (photosError) throw photosError;
 
     const codes = [...new Set((photos || []).map(p => p.event_code).filter(Boolean))];
