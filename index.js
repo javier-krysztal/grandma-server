@@ -147,9 +147,10 @@ async function uniqueGrandmaCode() {
 
 app.post('/save-reference', async (req, res) => {
   try {
-    const { parentId, photo } = req.body;
-    if (!parentId) {
-      return res.status(400).json({ error: 'parentId is required' });
+    const { parentId, childId, photo } = req.body;
+    const faceKey = childId || parentId;
+    if (!faceKey) {
+      return res.status(400).json({ error: 'childId or parentId is required' });
     }
 
     const bytes = decodePhoto(photo);
@@ -158,18 +159,100 @@ app.post('/save-reference', async (req, res) => {
     await rekognition
       .indexFaces({
         CollectionId: COLLECTION_ID,
-        ExternalImageId: rekognitionImageId(parentId),
+        ExternalImageId: rekognitionImageId(faceKey),
         Image: { Bytes: bytes },
         MaxFaces: 1,
         DetectionAttributes: ['DEFAULT'],
       })
       .promise();
 
-    await uploadJpeg(`references/${parentId}.jpg`, bytes);
+    await uploadJpeg(`references/${faceKey}.jpg`, bytes);
     return res.json({ success: true });
   } catch (err) {
     console.error('save-reference', err);
     return res.status(err.status || 500).json({ error: err.message || 'Failed to save reference' });
+  }
+});
+
+app.post('/register-child', async (req, res) => {
+  try {
+    const { parentId, childName, childDob } = req.body;
+    if (!parentId) return res.status(400).json({ error: 'parentId is required' });
+    const { data, error } = await supabase
+      .from('children')
+      .insert({ parent_id: parentId, child_name: childName || null, child_dob: childDob || null })
+      .select('child_id')
+      .single();
+    if (error) throw error;
+    return res.json({ childId: data.child_id });
+  } catch (err) {
+    console.error('register-child', err);
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to register child' });
+  }
+});
+
+app.get('/children/:parentId', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('children')
+      .select('child_id, child_name, child_dob')
+      .eq('parent_id', req.params.parentId)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    return res.json(data || []);
+  } catch (err) {
+    console.error('children', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/grandma-children/:code', async (req, res) => {
+  try {
+    const { data: family, error: familyError } = await supabase
+      .from('families')
+      .select('parent_id')
+      .eq('grandma_code', req.params.code)
+      .maybeSingle();
+    if (familyError) throw familyError;
+    if (!family) return res.status(404).json({ error: 'Family not found' });
+    const { data, error } = await supabase
+      .from('children')
+      .select('child_id, child_name')
+      .eq('parent_id', family.parent_id)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    return res.json(data || []);
+  } catch (err) {
+    console.error('grandma-children', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/migrate-faces', async (req, res) => {
+  try {
+    const { data: children, error } = await supabase.from('children').select('child_id, parent_id');
+    if (error) throw error;
+    let migrated = 0;
+    for (const child of children || []) {
+      for (const key of [`references/${child.child_id}.jpg`, `references/${child.parent_id}.jpg`]) {
+        try {
+          const obj = await s3.getObject({ Bucket: S3_BUCKET, Key: key }).promise();
+          await rekognition.indexFaces({
+            CollectionId: COLLECTION_ID,
+            ExternalImageId: rekognitionImageId(child.child_id),
+            Image: { Bytes: obj.Body },
+            MaxFaces: 1,
+            DetectionAttributes: ['DEFAULT'],
+          }).promise();
+          migrated++;
+          break;
+        } catch (e) { /* try next key */ }
+      }
+    }
+    return res.json({ migrated });
+  } catch (err) {
+    console.error('migrate-faces', err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -207,29 +290,49 @@ app.post('/check-photo', async (req, res) => {
       console.log(`  [${i}] ExternalImageId: ${m.Face?.ExternalImageId}, Similarity: ${m.Similarity}`);
     });
 
+    const { data: childrenRows } = await supabase
+      .from('children')
+      .select('child_id, child_name')
+      .eq('parent_id', parentId);
+    const children = childrenRows || [];
+    const childIds = new Set(children.map((c) => c.child_id));
     const expectedId = rekognitionImageId(parentId);
-    const match = faceMatches.find((m) => {
+
+    const matchedChildIds = [];
+    for (const m of faceMatches) {
       const confidence = m.Similarity ?? m.Face?.Confidence ?? 0;
       const externalId = m.Face?.ExternalImageId;
-      return confidence >= MATCH_CONFIDENCE && (!externalId || externalId === expectedId);
-    });
+      if (confidence < MATCH_CONFIDENCE || !externalId) continue;
+      if (childIds.has(externalId)) {
+        matchedChildIds.push(externalId);
+      } else if (externalId === expectedId) {
+        matchedChildIds.push(children.length ? children[0].child_id : null);
+      }
+    }
+    const uniqueChildren = [...new Set(matchedChildIds)];
+    console.log(`[check-photo] children matched: ${uniqueChildren.length}`);
 
-    console.log(`[check-photo] Expected ExternalImageId: ${expectedId}, match found: ${!!match}`);
-
-    if (!match) {
-      return res.json({ found: false, photoUrl: null });
+    if (!uniqueChildren.length) {
+      return res.json({ found: false, photoUrl: null, matchedChildren: [] });
     }
 
+    // Filter out children whose (child_id, asset_id) row already exists
+    let toSave = uniqueChildren;
     if (assetId) {
       const { data: existing } = await supabase
         .from('matched_photos')
-        .select('photo_url')
+        .select('child_id, photo_url')
         .eq('parent_id', parentId)
-        .eq('asset_id', assetId)
-        .limit(1);
-      if (existing && existing.length) {
-        console.log(`[check-photo] duplicate assetId ${assetId}, skipping save`);
-        return res.json({ found: true, photoUrl: existing[0].photo_url, duplicate: true });
+        .eq('asset_id', assetId);
+      const saved = new Set((existing || []).map((r) => r.child_id));
+      toSave = uniqueChildren.filter((c) => !saved.has(c));
+      if (!toSave.length && existing && existing.length) {
+        return res.json({
+          found: true,
+          photoUrl: existing[0].photo_url,
+          duplicate: true,
+          matchedChildren: children.filter((c) => uniqueChildren.includes(c.child_id)),
+        });
       }
     }
 
@@ -237,16 +340,18 @@ app.post('/check-photo', async (req, res) => {
     const key = `matches/${parentId}/${timestamp}.jpg`;
     const photoUrl = await uploadJpeg(key, bytes);
 
-    const insertData = {
-      parent_id: parentId,
-      photo_url: photoUrl,
-      taken_at: takenAt ? new Date(takenAt).toISOString() : new Date().toISOString(),
-      matched_at: new Date().toISOString(),
-    };
-    if (assetId) insertData.asset_id = assetId;
-
-    const { error: insertError } = await supabase.from('matched_photos').insert(insertData);
-    if (insertError) throw insertError;
+    for (const childId of toSave) {
+      const insertData = {
+        parent_id: parentId,
+        child_id: childId,
+        photo_url: photoUrl,
+        taken_at: takenAt ? new Date(takenAt).toISOString() : new Date().toISOString(),
+        matched_at: new Date().toISOString(),
+      };
+      if (assetId) insertData.asset_id = assetId;
+      const { error: insertError } = await supabase.from('matched_photos').insert(insertData);
+      if (insertError) throw insertError;
+    }
 
     const { data: family, error: familyError } = await supabase
       .from('families')
@@ -257,7 +362,11 @@ app.post('/check-photo', async (req, res) => {
 
     // SMS removed from here - fires once on registration only
 
-    return res.json({ found: true, photoUrl });
+    return res.json({
+      found: true,
+      photoUrl,
+      matchedChildren: children.filter((c) => uniqueChildren.includes(c.child_id)),
+    });
   } catch (err) {
     console.error('check-photo', err);
     return res.status(err.status || 500).json({ error: err.message || 'Failed to check photo' });
@@ -308,19 +417,24 @@ app.post('/register-family', async (req, res) => {
 app.get("/parent-feed/:parentId", async (req, res) => {
   try {
     const { parentId } = req.params;
-    const { data: photos, error } = await supabase.from("matched_photos").select("id, photo_url, matched_at, taken_at, event_code").eq("parent_id", parentId).order("taken_at", { ascending: false, nullsFirst: false });
+    const { data: photos, error } = await supabase.from("matched_photos").select("id, photo_url, matched_at, taken_at, event_code, child_id").eq("parent_id", parentId).order("taken_at", { ascending: false, nullsFirst: false });
     if (error) throw error;
     const codes = [...new Set((photos || []).map(p => p.event_code).filter(Boolean))];
-    let eventNames = {};
+    const cids = [...new Set((photos || []).map(p => p.child_id).filter(Boolean))];
+    let eventNames = {}, childNames = {};
     if (codes.length) {
       const { data: evs } = await supabase.from('events').select('event_code, event_name').in('event_code', codes);
       for (const e of evs || []) eventNames[e.event_code] = e.event_name;
+    }
+    if (cids.length) {
+      const { data: cs } = await supabase.from('children').select('child_id, child_name').in('child_id', cids);
+      for (const c of cs || []) childNames[c.child_id] = c.child_name;
     }
     const feed = (photos || []).map((photo) => {
       const url = photo.photo_url || "";
       const bucketPrefix = `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/`;
       const key = url.startsWith(bucketPrefix) ? url.replace(bucketPrefix, "") : url;
-      return { ...photo, photo_url: signedS3Url(key), taken_at: photo.taken_at || photo.matched_at, event_name: eventNames[photo.event_code] || null };
+      return { ...photo, photo_url: signedS3Url(key), taken_at: photo.taken_at || photo.matched_at, event_name: eventNames[photo.event_code] || null, child_name: childNames[photo.child_id] || null };
     }).sort((a, b) => new Date(b.taken_at || b.matched_at) - new Date(a.taken_at || a.matched_at));
     return res.json(feed);
   } catch (err) {
@@ -343,16 +457,21 @@ app.get('/grandma-feed/:grandmaCode', async (req, res) => {
 
     const { data: photos, error: photosError } = await supabase
       .from('matched_photos')
-      .select('id, parent_id, photo_url, matched_at, taken_at, event_code')
+      .select('id, parent_id, photo_url, matched_at, taken_at, event_code, child_id')
       .eq('parent_id', family.parent_id)
       .order('taken_at', { ascending: false, nullsFirst: false });
     if (photosError) throw photosError;
 
     const codes = [...new Set((photos || []).map(p => p.event_code).filter(Boolean))];
-    let eventNames = {};
+    const cids = [...new Set((photos || []).map(p => p.child_id).filter(Boolean))];
+    let eventNames = {}, childNames = {};
     if (codes.length) {
       const { data: evs } = await supabase.from('events').select('event_code, event_name').in('event_code', codes);
       for (const e of evs || []) eventNames[e.event_code] = e.event_name;
+    }
+    if (cids.length) {
+      const { data: cs } = await supabase.from('children').select('child_id, child_name').in('child_id', cids);
+      for (const c of cs || []) childNames[c.child_id] = c.child_name;
     }
 
     const feed = (photos || []).map((photo) => {
@@ -365,7 +484,7 @@ app.get('/grandma-feed/:grandmaCode', async (req, res) => {
         photo_url: signedUrl,
         taken_at: photo.taken_at || photo.matched_at,
         event_name: eventNames[photo.event_code] || null,
-        child_name: family.child_name,
+        child_name: childNames[photo.child_id] || family.child_name,
         child_dob: family.child_dob,
       };
     }).sort((a, b) => new Date(b.taken_at || b.matched_at) - new Date(a.taken_at || a.matched_at));
@@ -477,19 +596,28 @@ app.post('/teacher-upload', async (req, res) => {
 
     let matches = 0;
     const parentIdsInClass = new Set(classMembers.map(m => m.parent_id));
+    const extIds = [...new Set((search.FaceMatches || []).map(m => m.Face?.ExternalImageId).filter(Boolean))];
+    const { data: childRows } = extIds.length
+      ? await supabase.from('children').select('child_id, parent_id').in('child_id', extIds)
+      : { data: [] };
+    const childToParent = {};
+    for (const c of childRows || []) childToParent[c.child_id] = c.parent_id;
 
     for (const faceMatch of search.FaceMatches || []) {
       const externalId = faceMatch.Face?.ExternalImageId;
       if (!externalId) continue;
+      const ownerParentId = childToParent[externalId] || externalId;
+      const childId = childToParent[externalId] ? externalId : null;
 
       // Check if this parent is in the class
-      if (parentIdsInClass.has(externalId)) {
+      if (parentIdsInClass.has(ownerParentId)) {
         const timestamp = Date.now();
-        const key = `teacher-photos/${classCode}/${externalId}/${timestamp}.jpg`;
+        const key = `teacher-photos/${classCode}/${ownerParentId}/${timestamp}.jpg`;
         const photoUrl = await uploadJpeg(key, bytes);
 
         const { error: insertError } = await supabase.from('matched_photos').insert({
-          parent_id: externalId,
+          parent_id: ownerParentId,
+          child_id: childId,
           photo_url: photoUrl,
           class_code: classCode,
           matched_at: new Date().toISOString(),
@@ -615,25 +743,34 @@ app.post('/event-upload', async (req, res) => {
 
     let matches = 0;
     const parentIdsInClass = new Set(classMembers.map(m => m.parent_id));
+    const extIds = [...new Set((search.FaceMatches || []).map(m => m.Face?.ExternalImageId).filter(Boolean))];
+    const { data: childRows } = extIds.length
+      ? await supabase.from('children').select('child_id, parent_id').in('child_id', extIds)
+      : { data: [] };
+    const childToParent = {};
+    for (const c of childRows || []) childToParent[c.child_id] = c.parent_id;
 
     for (const faceMatch of search.FaceMatches || []) {
       const externalId = faceMatch.Face?.ExternalImageId;
       if (!externalId) continue;
+      const ownerParentId = childToParent[externalId] || externalId;
+      const childId = childToParent[externalId] ? externalId : null;
 
       // Check if this parent is in the class
-      if (parentIdsInClass.has(externalId)) {
+      if (parentIdsInClass.has(ownerParentId)) {
         const { error: insertError } = await supabase.from('event_photos').insert({
           event_code: eventCode,
           parent_id: parentId,
           photo_url: photoUrl,
-          matched_parent_id: externalId,
+          matched_parent_id: ownerParentId,
           matched_at: new Date().toISOString(),
           created_at: new Date().toISOString(),
         });
         if (insertError) throw insertError;
 
         const { error: matchInsertError } = await supabase.from('matched_photos').insert({
-          parent_id: externalId,
+          parent_id: ownerParentId,
+          child_id: childId,
           photo_url: photoUrl,
           event_code: eventCode,
           taken_at: new Date().toISOString(),
