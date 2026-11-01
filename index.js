@@ -671,8 +671,8 @@ app.post('/teacher-upload', async (req, res) => {
 
       // Check if this parent is in the class
       if (parentIdsInClass.has(ownerParentId)) {
-        const timestamp = Date.now();
-        const key = `teacher-photos/${classCode}/${ownerParentId}/${timestamp}.jpg`;
+        const hash = crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 16);
+        const key = `teacher-photos/${classCode}/${ownerParentId}/${hash}.jpg`;
         const photoUrl = await uploadJpeg(key, bytes);
 
         const insertRow = {
@@ -706,11 +706,46 @@ async function ensureClassMember(classCode, parentId) {
   }
 }
 
+app.get('/my-events/:parentId', async (req, res) => {
+  try {
+    const { parentId } = req.params;
+    const { data: memberships } = await supabase
+      .from('class_members')
+      .select('class_code')
+      .eq('parent_id', parentId);
+    const classCodes = [...new Set((memberships || []).map((m) => m.class_code))];
+    const { data: events, error } = await supabase
+      .from('events')
+      .select('event_code, event_name, class_code, created_by, created_at')
+      .or(`created_by.eq.${parentId}${classCodes.length ? `,class_code.in.(${classCodes.join(',')})` : ''}`)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    return res.json(events || []);
+  } catch (err) {
+    console.error('my-events', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/create-event', async (req, res) => {
   try {
-    const { parentId, eventName, classCode } = req.body;
+    const { parentId, eventName, classCode, requestId } = req.body;
     if (!parentId || !eventName || !classCode) {
       return res.status(400).json({ error: 'parentId, eventName, and classCode are required' });
+    }
+
+    // Idempotent: same parent + name + class returns the existing event
+    const { data: existingEvent } = await supabase
+      .from('events')
+      .select()
+      .eq('created_by', parentId)
+      .eq('event_name', eventName)
+      .eq('class_code', classCode)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (existingEvent) {
+      return res.json({ success: true, event: existingEvent, existing: true });
     }
 
     await ensureClassMember(classCode, parentId);
@@ -776,7 +811,7 @@ app.post('/join-event', async (req, res) => {
 
 app.post('/event-upload', async (req, res) => {
   try {
-    const { eventCode, photo, parentId } = req.body;
+    const { eventCode, photo, parentId, requestId } = req.body;
     if (!eventCode || !photo || !parentId) {
       return res.status(400).json({ error: 'eventCode, photo, and parentId are required' });
     }
@@ -802,10 +837,21 @@ app.post('/event-upload', async (req, res) => {
       .eq('class_code', event.class_code);
     if (membersError) throw membersError;
 
-    // Upload photo to S3
-    const timestamp = Date.now();
-    const key = `event-photos/${eventCode}/${parentId}/${timestamp}.jpg`;
+    // Content-hash key: same photo in this event = same key (idempotent)
+    const hash = crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 16);
+    const key = `event-photos/${eventCode}/${parentId}/${hash}.jpg`;
     const photoUrl = await uploadJpeg(key, bytes);
+
+    // Skip if this exact photo is already in the event
+    const { data: dup } = await supabase
+      .from('event_photos')
+      .select('id')
+      .eq('event_code', eventCode)
+      .eq('photo_url', photoUrl)
+      .limit(1);
+    if (dup && dup.length) {
+      return res.json({ matches: 0, totalFaces: 0, skipped: true });
+    }
 
     // Run face recognition
     let matchedExtIds;
