@@ -659,9 +659,10 @@ app.post('/teacher-upload', async (req, res) => {
     const parentIdsInClass = new Set((classMembers || []).map(m => m.parent_id).filter(Boolean));
     const seenRecipients = new Set();
     const extIds = matchedExtIds;
-    const { data: childRows } = (MULTI_CHILD_ENABLED && extIds.length)
+    const { data: childRows, error: childRowsError } = (MULTI_CHILD_ENABLED && extIds.length)
       ? await supabase.from('children').select('child_id, parent_id').in('child_id', extIds)
-      : { data: [] };
+      : { data: [], error: null };
+    if (childRowsError) throw childRowsError;
     const childToParent = {};
     for (const c of childRows || []) childToParent[c.child_id] = c.parent_id;
 
@@ -692,10 +693,14 @@ app.post('/teacher-upload', async (req, res) => {
       }
     }
 
-    return res.json({ matches, totalFaces: matchedExtIds.length });
+    return res.json({ matches, totalFaces: matchedExtIds.length, failed: false });
   } catch (err) {
     console.error('teacher-upload', err);
-    return res.status(err.status || 500).json({ error: err.message || 'Failed to process teacher upload' });
+    return res.status(err.status || 500).json({
+      error: 'server_error',
+      failed: true,
+      matches: 0,
+    });
   }
 });
 
