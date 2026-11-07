@@ -833,10 +833,12 @@ const JOIN_CLASS_MAX_FAILURES_PARENT = Number(process.env.JOIN_CLASS_MAX_FAILURE
 const JOIN_CLASS_MAP_PRUNE_THRESHOLD = 1000;
 const joinClassFailuresByIp = new Map();
 const joinClassFailuresByParent = new Map();
-global.__getJoinClassFailureMapSizes = () => ({
-  ip: joinClassFailuresByIp.size,
-  parent: joinClassFailuresByParent.size,
-});
+if (process.env.NODE_ENV === 'test') {
+  global.__getJoinClassFailureMapSizes = () => ({
+    ip: joinClassFailuresByIp.size,
+    parent: joinClassFailuresByParent.size,
+  });
+}
 
 function getClientIp(req) {
   const realIp = req.headers && req.headers['x-real-ip'];

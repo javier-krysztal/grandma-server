@@ -143,7 +143,7 @@ function makeQueryBuilder(table) {
 let serverInstance = null;
 
 before(() => {
-  process.env.NODE_ENV = 'production';
+  process.env.NODE_ENV = 'test';
   process.env.PORT = String(TEST_PORT);
   process.env.AWS_ACCESS_KEY_ID = 'mock-key';
   process.env.AWS_SECRET_ACCESS_KEY = 'mock-secret';
