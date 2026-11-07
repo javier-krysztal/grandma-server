@@ -699,6 +699,10 @@ app.post('/teacher-upload', async (req, res) => {
   }
 });
 
+function isValidParentId(id) {
+  return typeof id === 'string' && id.length >= 1 && id.length <= 100;
+}
+
 // Event mode endpoints
 async function ensureClassMember(classCode, parentId) {
   const { data: existingClass, error: classSelectError } = await supabase
@@ -711,7 +715,7 @@ async function ensureClassMember(classCode, parentId) {
     const { error: classInsertError } = await supabase
       .from('classes')
       .insert({ class_code: classCode, teacher_name: 'Event' });
-    if (classInsertError) throw classInsertError;
+    if (classInsertError && classInsertError.code !== '23505') throw classInsertError;
   }
 
   const { data: family, error: familyError } = await supabase
@@ -733,7 +737,7 @@ async function ensureClassMember(classCode, parentId) {
     const { error: memberInsertError } = await supabase
       .from('class_members')
       .insert({ class_code: classCode, parent_id: parentId, child_name: family?.child_name || '' });
-    if (memberInsertError) throw memberInsertError;
+    if (memberInsertError && memberInsertError.code !== '23505') throw memberInsertError;
   }
 }
 
@@ -761,7 +765,10 @@ app.get('/my-events/:parentId', async (req, res) => {
 app.post('/create-event', async (req, res) => {
   try {
     const { parentId, eventName, classCode } = req.body || {};
-    if (!parentId || !eventName || !classCode) {
+    if (!isValidParentId(parentId)) {
+      return res.status(400).json({ error: 'invalid_parent_id' });
+    }
+    if (!eventName || !classCode) {
       return res.status(400).json({ error: 'parentId, eventName, and classCode are required' });
     }
 
@@ -826,6 +833,10 @@ const JOIN_CLASS_MAX_FAILURES_PARENT = Number(process.env.JOIN_CLASS_MAX_FAILURE
 const JOIN_CLASS_MAP_PRUNE_THRESHOLD = 1000;
 const joinClassFailuresByIp = new Map();
 const joinClassFailuresByParent = new Map();
+global.__getJoinClassFailureMapSizes = () => ({
+  ip: joinClassFailuresByIp.size,
+  parent: joinClassFailuresByParent.size,
+});
 
 function getClientIp(req) {
   const realIp = req.headers && req.headers['x-real-ip'];
@@ -875,8 +886,8 @@ app.post('/join-class', async (req, res) => {
     if (typeof classCode !== 'string' || !/^\d{4}$/.test(classCode)) {
       return res.status(400).json({ error: 'invalid_class_code' });
     }
-    if (!parentId) {
-      return res.status(400).json({ error: 'classCode and parentId are required' });
+    if (!isValidParentId(parentId)) {
+      return res.status(400).json({ error: 'invalid_parent_id' });
     }
     const ip = getClientIp(req);
     const now = Date.now();
@@ -926,7 +937,7 @@ app.post('/join-class', async (req, res) => {
       const { error: insertError } = await supabase
         .from('class_members')
         .insert({ class_code: classCode, parent_id: parentId, child_name: resolvedChildName });
-      if (insertError) throw insertError;
+      if (insertError && insertError.code !== '23505') throw insertError;
     }
     console.log(`[join-class] classCode=${classCode} parentId=${parentId}`);
     return res.status(200).json({ joined: true });
@@ -939,7 +950,10 @@ app.post('/join-class', async (req, res) => {
 app.post('/join-event', async (req, res) => {
   try {
     const { eventCode, parentId } = req.body || {};
-    if (!eventCode || !parentId) {
+    if (!isValidParentId(parentId)) {
+      return res.status(400).json({ error: 'invalid_parent_id' });
+    }
+    if (!eventCode) {
       return res.status(400).json({ error: 'eventCode and parentId are required' });
     }
     const { data: event, error: eventError } = await supabase

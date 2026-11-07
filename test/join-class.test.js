@@ -8,6 +8,7 @@ const ALLOWED_CLASS_MEMBERS_COLS = new Set(['class_code', 'parent_id', 'child_na
 const mockState = {
   throwErrorOnTable: null,
   failSelectOnTable: null,
+  simulate23505OnClassMembersInsert: false,
   stripSocketRemoteAddress: false,
   tables: {
     families: [],
@@ -19,6 +20,7 @@ const mockState = {
 function resetState() {
   mockState.throwErrorOnTable = null;
   mockState.failSelectOnTable = null;
+  mockState.simulate23505OnClassMembersInsert = false;
   mockState.stripSocketRemoteAddress = false;
   for (const k of Object.keys(mockState.tables)) {
     mockState.tables[k] = [];
@@ -110,6 +112,11 @@ function makeQueryBuilder(table) {
         }).then(resolve, reject);
       }
       if (pendingInsert) {
+        if (table === 'class_members' && mockState.simulate23505OnClassMembersInsert) {
+          const dupErr = new Error('duplicate key value violates unique constraint');
+          dupErr.code = '23505';
+          return Promise.resolve({ data: null, error: dupErr }).then(resolve, reject);
+        }
         const inserted = pendingInsertPayload.map((item, idx) => {
           const row =
             table === 'class_members'
@@ -265,7 +272,7 @@ function requestJson(method, path, body, extraHeaders = {}) {
   });
 }
 
-test('POST /join-class validates classCode against /^\\d{4}$/ and returns 400 {"error":"invalid_class_code"}', async () => {
+test('POST /join-class validates classCode against /^\\d{4}$/ and parentId (1..100 chars)', async () => {
   for (const bad of ['', '123', '12345', 'abcd', '12a4', null, 1234]) {
     const res = await requestJson(
       'POST',
@@ -276,6 +283,31 @@ test('POST /join-class validates classCode against /^\\d{4}$/ and returns 400 {"
     assert.equal(res.status, 400);
     assert.deepEqual(res.data, { error: 'invalid_class_code' });
   }
+
+  for (const badParent of [undefined, null, '', 123, {}, 'p'.repeat(101)]) {
+    const res = await requestJson(
+      'POST',
+      '/join-class',
+      { classCode: '1234', parentId: badParent },
+      { 'x-real-ip': '10.0.0.1', 'x-forwarded-for': '10.0.0.1' }
+    );
+    assert.equal(res.status, 400);
+    assert.deepEqual(res.data, { error: 'invalid_parent_id' });
+  }
+});
+
+test('POST /join-class treats Postgres 23505 unique violation on concurrent class_members insert as 200 {"joined":true}', async () => {
+  mockState.tables.classes.push({ class_code: '4321', teacher_name: 'גננת רונית' });
+  mockState.simulate23505OnClassMembersInsert = true;
+
+  const res = await requestJson(
+    'POST',
+    '/join-class',
+    { classCode: '4321', parentId: 'parent-23505', childName: 'מאיה' },
+    { 'x-real-ip': '10.0.0.99', 'x-forwarded-for': '10.0.0.99' }
+  );
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.data, { joined: true });
 });
 
 test('POST /join-class saves childName (capped at 100 chars) in 3-column class_members and second join creates no second row', async () => {
@@ -439,6 +471,10 @@ test('POST /join-class prunes expired entries when failure maps exceed 1000 entr
       assert.equal(res.status, 404);
     }
 
+    const sizesBefore = global.__getJoinClassFailureMapSizes();
+    assert.ok(sizesBefore.ip > 1000, `expected ip map > 1000, got ${sizesBefore.ip}`);
+    assert.ok(sizesBefore.parent > 1000, `expected parent map > 1000, got ${sizesBefore.parent}`);
+
     Date.now = () => baseTime + 11 * 60 * 1000;
     const afterExpiry = await requestJson(
       'POST',
@@ -448,6 +484,10 @@ test('POST /join-class prunes expired entries when failure maps exceed 1000 entr
     );
     assert.equal(afterExpiry.status, 404);
     assert.deepEqual(afterExpiry.data, { error: 'class_not_found' });
+
+    const sizesAfter = global.__getJoinClassFailureMapSizes();
+    assert.equal(sizesAfter.ip, 1);
+    assert.equal(sizesAfter.parent, 1);
   } finally {
     Date.now = realDateNow;
   }
