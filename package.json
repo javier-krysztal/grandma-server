@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "lint": "npx --yes eslint@8 -c .eslintrc.json index.js delete-parent.js test/",
+    "test": "node --test test/",
+    "check": "npm run lint && npm test"
   },
   "keywords": [],
   "author": "",
