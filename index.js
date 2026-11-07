@@ -656,7 +656,8 @@ app.post('/teacher-upload', async (req, res) => {
     }
 
     let matches = 0;
-    const parentIdsInClass = new Set(classMembers.map(m => m.parent_id));
+    const parentIdsInClass = new Set((classMembers || []).map(m => m.parent_id).filter(Boolean));
+    const seenRecipients = new Set();
     const extIds = matchedExtIds;
     const { data: childRows } = (MULTI_CHILD_ENABLED && extIds.length)
       ? await supabase.from('children').select('child_id, parent_id').in('child_id', extIds)
@@ -668,9 +669,11 @@ app.post('/teacher-upload', async (req, res) => {
       if (!externalId) continue;
       const ownerParentId = childToParent[externalId] || externalId;
       const childId = childToParent[externalId] ? externalId : null;
+      const recipientKey = MULTI_CHILD_ENABLED && childId ? `${ownerParentId}:${childId}` : ownerParentId;
 
-      // Check if this parent is in the class
-      if (parentIdsInClass.has(ownerParentId)) {
+      // Check if this parent is in the class and not already routed for this photo
+      if (parentIdsInClass.has(ownerParentId) && !seenRecipients.has(recipientKey)) {
+        seenRecipients.add(recipientKey);
         const hash = crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 16);
         const key = `teacher-photos/${classCode}/${ownerParentId}/${hash}.jpg`;
         const photoUrl = await uploadJpeg(key, bytes);
@@ -698,11 +701,39 @@ app.post('/teacher-upload', async (req, res) => {
 
 // Event mode endpoints
 async function ensureClassMember(classCode, parentId) {
-  await supabase.from('classes').upsert({ class_code: classCode, teacher_name: 'Event' }, { onConflict: 'class_code', ignoreDuplicates: true });
-  const { data: family } = await supabase.from('families').select('child_name').eq('parent_id', parentId).maybeSingle();
-  const { data: existing } = await supabase.from('class_members').select('id').eq('class_code', classCode).eq('parent_id', parentId).limit(1);
-  if (!existing || !existing.length) {
-    await supabase.from('class_members').insert({ class_code: classCode, parent_id: parentId, child_name: family?.child_name || '' });
+  const { data: existingClass, error: classSelectError } = await supabase
+    .from('classes')
+    .select('class_code')
+    .eq('class_code', classCode)
+    .limit(1);
+  if (classSelectError) throw classSelectError;
+  if (!existingClass || !existingClass.length) {
+    const { error: classInsertError } = await supabase
+      .from('classes')
+      .insert({ class_code: classCode, teacher_name: 'Event' });
+    if (classInsertError) throw classInsertError;
+  }
+
+  const { data: family, error: familyError } = await supabase
+    .from('families')
+    .select('child_name')
+    .eq('parent_id', parentId)
+    .maybeSingle();
+  if (familyError) throw familyError;
+
+  const { data: existingMember, error: memberSelectError } = await supabase
+    .from('class_members')
+    .select('parent_id')
+    .eq('class_code', classCode)
+    .eq('parent_id', parentId)
+    .limit(1);
+  if (memberSelectError) throw memberSelectError;
+
+  if (!existingMember || !existingMember.length) {
+    const { error: memberInsertError } = await supabase
+      .from('class_members')
+      .insert({ class_code: classCode, parent_id: parentId, child_name: family?.child_name || '' });
+    if (memberInsertError) throw memberInsertError;
   }
 }
 
@@ -729,21 +760,22 @@ app.get('/my-events/:parentId', async (req, res) => {
 
 app.post('/create-event', async (req, res) => {
   try {
-    const { parentId, eventName, classCode, requestId } = req.body;
+    const { parentId, eventName, classCode } = req.body || {};
     if (!parentId || !eventName || !classCode) {
       return res.status(400).json({ error: 'parentId, eventName, and classCode are required' });
     }
 
     // Idempotent: same parent + name + class returns the existing event
-    const { data: existingEvent } = await supabase
+    const { data: existingEvent, error: existingEventError } = await supabase
       .from('events')
-      .select()
+      .select('event_code, event_name, class_code, created_by, created_at')
       .eq('created_by', parentId)
       .eq('event_name', eventName)
       .eq('class_code', classCode)
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
+    if (existingEventError) throw existingEventError;
     if (existingEvent) {
       return res.json({ success: true, event: existingEvent, existing: true });
     }
@@ -766,7 +798,7 @@ app.post('/create-event', async (req, res) => {
       }
     }
     if (!eventCode) {
-      return res.status(500).json({ error: 'Could not generate unique event code' });
+      return res.status(500).json({ error: 'server_error' });
     }
 
     const { data, error } = await supabase
@@ -777,20 +809,20 @@ app.post('/create-event', async (req, res) => {
         class_code: classCode,
         created_by: parentId,
       })
-      .select()
+      .select('event_code, event_name, class_code, created_by, created_at')
       .single();
     if (error) throw error;
 
     return res.json({ success: true, event: data });
   } catch (err) {
     console.error('create-event', err);
-    return res.status(err.status || 500).json({ error: err.message || 'Failed to create event' });
+    return res.status(500).json({ error: 'server_error' });
   }
 });
 
 app.post('/join-event', async (req, res) => {
   try {
-    const { eventCode, parentId } = req.body;
+    const { eventCode, parentId } = req.body || {};
     if (!eventCode || !parentId) {
       return res.status(400).json({ error: 'eventCode and parentId are required' });
     }
@@ -805,7 +837,7 @@ app.post('/join-event', async (req, res) => {
     return res.json({ success: true, eventName: event.event_name, classCode: event.class_code });
   } catch (err) {
     console.error('join-event', err);
-    return res.status(err.status || 500).json({ error: err.message || 'Failed to join event' });
+    return res.status(500).json({ error: 'server_error' });
   }
 });
 
@@ -874,7 +906,8 @@ app.post('/event-upload', async (req, res) => {
     }
 
     let matches = 0;
-    const parentIdsInClass = new Set(classMembers.map(m => m.parent_id));
+    const parentIdsInClass = new Set((classMembers || []).map(m => m.parent_id).filter(Boolean));
+    const seenRecipients = new Set();
     const extIds = matchedExtIds;
     const { data: childRows } = (MULTI_CHILD_ENABLED && extIds.length)
       ? await supabase.from('children').select('child_id, parent_id').in('child_id', extIds)
@@ -886,9 +919,11 @@ app.post('/event-upload', async (req, res) => {
       if (!externalId) continue;
       const ownerParentId = childToParent[externalId] || externalId;
       const childId = childToParent[externalId] ? externalId : null;
+      const recipientKey = MULTI_CHILD_ENABLED && childId ? `${ownerParentId}:${childId}` : ownerParentId;
 
-      // Check if this parent is in the class
-      if (parentIdsInClass.has(ownerParentId)) {
+      // Check if this parent is in the class and not already routed for this photo
+      if (parentIdsInClass.has(ownerParentId) && !seenRecipients.has(recipientKey)) {
+        seenRecipients.add(recipientKey);
         const { error: insertError } = await supabase.from('event_photos').insert({
           event_code: eventCode,
           parent_id: parentId,
