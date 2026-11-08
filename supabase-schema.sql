@@ -43,6 +43,9 @@ CREATE INDEX IF NOT EXISTS idx_event_photos_event_code ON event_photos(event_cod
 CREATE INDEX IF NOT EXISTS idx_event_photos_parent_id ON event_photos(parent_id);
 CREATE INDEX IF NOT EXISTS idx_event_photos_matched_parent_id ON event_photos(matched_parent_id);
 
+-- Added to the live database on Nov 7, 2026 for /teacher-upload
+ALTER TABLE matched_photos ADD COLUMN IF NOT EXISTS class_code TEXT;
+
 -- Multi-children support
 CREATE TABLE IF NOT EXISTS children (
   child_id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
