@@ -16,6 +16,7 @@ const mockState = {
   },
   searchFacesResult: { FaceMatches: [] },
   failSelectOnTable: null,
+  simulate23505OnClassMembersInsert: false,
   tables: {
     families: [],
     matched_photos: [],
@@ -30,6 +31,7 @@ const mockState = {
 function resetState() {
   mockState.s3Puts = [];
   mockState.failSelectOnTable = null;
+  mockState.simulate23505OnClassMembersInsert = false;
   mockState.searchFacesResult = { FaceMatches: [] };
   for (const k of Object.keys(mockState.tables)) {
     mockState.tables[k] = [];
@@ -125,6 +127,11 @@ function makeQueryBuilder(table) {
         }).then(resolve, reject);
       }
       if (pendingInsert) {
+        if (table === 'class_members' && mockState.simulate23505OnClassMembersInsert) {
+          const dupErr = new Error('duplicate key value violates unique constraint');
+          dupErr.code = '23505';
+          return Promise.resolve({ data: null, error: dupErr }).then(resolve, reject);
+        }
         const inserted = pendingInsertPayload.map((item, idx) => {
           const row =
             table === 'class_members'
@@ -408,4 +415,44 @@ test('event-upload and teacher-upload deduplicate recipients even when class_mem
   assert.equal(teacherUpload.status, 200);
   assert.equal(teacherUpload.data.matches, 1);
   assert.equal(mockState.tables.matched_photos.length, 2);
+});
+
+test('create-event and join-event validate parentId (1..100 chars) and return 400 {"error":"invalid_parent_id"}', async () => {
+  for (const badId of [undefined, null, '', 123, 'p'.repeat(101)]) {
+    const createRes = await requestJson('POST', '/create-event', {
+      parentId: badId,
+      eventName: 'Party',
+      classCode: '4242',
+    });
+    assert.equal(createRes.status, 400);
+    assert.deepEqual(createRes.data, { error: 'invalid_parent_id' });
+
+    const joinRes = await requestJson('POST', '/join-event', {
+      eventCode: '1111',
+      parentId: badId,
+    });
+    assert.equal(joinRes.status, 400);
+    assert.deepEqual(joinRes.data, { error: 'invalid_parent_id' });
+  }
+});
+
+test('ensureClassMember in create-event and join-event treats Postgres 23505 unique violation on class_members insert as success', async () => {
+  mockState.tables.classes.push({ class_code: '4242', teacher_name: 'Event' });
+  mockState.simulate23505OnClassMembersInsert = true;
+
+  const createRes = await requestJson('POST', '/create-event', {
+    parentId: 'parent-race-1',
+    eventName: 'Race Party',
+    classCode: '4242',
+  });
+  assert.equal(createRes.status, 200);
+  assert.equal(createRes.data.success, true);
+
+  const eventCode = createRes.data.event.event_code;
+  const joinRes = await requestJson('POST', '/join-event', {
+    eventCode,
+    parentId: 'parent-race-2',
+  });
+  assert.equal(joinRes.status, 200);
+  assert.equal(joinRes.data.success, true);
 });
