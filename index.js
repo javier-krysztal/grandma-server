@@ -265,8 +265,82 @@ app.get('/children/:parentId', async (req, res) => {
   }
 });
 
+const JOIN_CLASS_WINDOW_MS = Number(process.env.SHORT_CODE_WINDOW_MS) || Number(process.env.JOIN_CLASS_WINDOW_MS) || 10 * 60 * 1000;
+const JOIN_CLASS_MAX_FAILURES_IP = Number(process.env.SHORT_CODE_MAX_FAILURES_IP) || Number(process.env.JOIN_CLASS_MAX_FAILURES_IP) || 20;
+const JOIN_CLASS_MAX_FAILURES_PARENT = Number(process.env.JOIN_CLASS_MAX_FAILURES_PARENT) || 5;
+const JOIN_CLASS_MAP_PRUNE_THRESHOLD = 1000;
+const joinClassFailuresByIp = new Map();
+const joinClassFailuresByParent = new Map();
+if (process.env.NODE_ENV === 'test') {
+  global.__getJoinClassFailureMapSizes = () => ({
+    ip: joinClassFailuresByIp.size,
+    parent: joinClassFailuresByParent.size,
+  });
+}
+
+function getClientIp(req) {
+  const realIp = req.headers && req.headers['x-real-ip'];
+  if (typeof realIp === 'string' && realIp.trim()) {
+    return realIp.split(',')[0].trim();
+  }
+  if (Array.isArray(realIp) && realIp.length && realIp[0].trim()) {
+    return realIp[0].split(',')[0].trim();
+  }
+  const remote = req.socket && req.socket.remoteAddress;
+  if (typeof remote === 'string' && remote.trim()) {
+    return remote.trim();
+  }
+  return null;
+}
+
+function pruneFailureMapIfNeeded(map, now) {
+  if (map.size > JOIN_CLASS_MAP_PRUNE_THRESHOLD) {
+    for (const [k, v] of map.entries()) {
+      if (!v || v.resetAt <= now) {
+        map.delete(k);
+      }
+    }
+  }
+}
+
+function isJoinClassThrottled(map, key, now, maxFailures) {
+  if (!key) return false;
+  const entry = map.get(key);
+  if (!entry || entry.resetAt <= now) return false;
+  return entry.count >= maxFailures;
+}
+
+function recordJoinClassFailure(map, key, now) {
+  if (!key) return;
+  let entry = map.get(key);
+  if (!entry || entry.resetAt <= now) {
+    entry = { count: 0, resetAt: now + JOIN_CLASS_WINDOW_MS };
+    map.set(key, entry);
+  }
+  entry.count += 1;
+}
+
+function checkShortCodeIpThrottle(req) {
+  const ip = getClientIp(req);
+  const now = Date.now();
+  pruneFailureMapIfNeeded(joinClassFailuresByIp, now);
+  const throttled =
+    ip !== null && isJoinClassThrottled(joinClassFailuresByIp, ip, now, JOIN_CLASS_MAX_FAILURES_IP);
+  return { ip, now, throttled };
+}
+
+function recordShortCodeIpNotFound(ip, now) {
+  if (ip !== null) {
+    recordJoinClassFailure(joinClassFailuresByIp, ip, now);
+  }
+}
+
 app.get('/grandma-children/:code', async (req, res) => {
   try {
+    const { ip, now, throttled } = checkShortCodeIpThrottle(req);
+    if (throttled) {
+      return res.status(429).json({ error: 'too_many_attempts' });
+    }
     if (!MULTI_CHILD_ENABLED) return res.json([]);
     const { data: family, error: familyError } = await supabase
       .from('families')
@@ -274,7 +348,10 @@ app.get('/grandma-children/:code', async (req, res) => {
       .eq('grandma_code', req.params.code)
       .maybeSingle();
     if (familyError) throw familyError;
-    if (!family) return res.status(404).json({ error: 'Family not found' });
+    if (!family) {
+      recordShortCodeIpNotFound(ip, now);
+      return res.status(404).json({ error: 'Family not found' });
+    }
     const { data, error } = await supabase
       .from('children')
       .select('child_id, child_name')
@@ -512,6 +589,10 @@ app.get("/parent-feed/:parentId", async (req, res) => {
 });
 app.get('/grandma-feed/:grandmaCode', async (req, res) => {
   try {
+    const { ip, now, throttled } = checkShortCodeIpThrottle(req);
+    if (throttled) {
+      return res.status(429).json({ error: 'too_many_attempts' });
+    }
     const { grandmaCode } = req.params;
     const { data: family, error: familyError } = await supabase
       .from('families')
@@ -520,6 +601,7 @@ app.get('/grandma-feed/:grandmaCode', async (req, res) => {
       .maybeSingle();
     if (familyError) throw familyError;
     if (!family) {
+      recordShortCodeIpNotFound(ip, now);
       return res.status(404).json({ error: 'Family not found' });
     }
 
@@ -566,9 +648,13 @@ app.get('/grandma-feed/:grandmaCode', async (req, res) => {
 
 app.post('/grandma-heart', async (req, res) => {
   try {
-    const { grandmaCode, photoUrl } = req.body;
+    const { grandmaCode, photoUrl } = req.body || {};
     if (!grandmaCode || !photoUrl) {
       return res.status(400).json({ error: 'grandmaCode and photoUrl are required' });
+    }
+    const { ip, now, throttled } = checkShortCodeIpThrottle(req);
+    if (throttled) {
+      return res.status(429).json({ error: 'too_many_attempts' });
     }
 
     const { data: family, error } = await supabase
@@ -578,6 +664,7 @@ app.post('/grandma-heart', async (req, res) => {
       .maybeSingle();
     if (error) throw error;
     if (!family) {
+      recordShortCodeIpNotFound(ip, now);
       return res.status(404).json({ error: 'Family not found' });
     }
 
@@ -625,9 +712,13 @@ app.post('/create-class', async (req, res) => {
 
 app.post('/teacher-upload', async (req, res) => {
   try {
-    const { classCode, photo } = req.body;
+    const { classCode, photo } = req.body || {};
     if (!classCode || !photo) {
       return res.status(400).json({ error: 'classCode and photo are required' });
+    }
+    const { ip, now, throttled } = checkShortCodeIpThrottle(req);
+    if (throttled) {
+      return res.status(429).json({ error: 'too_many_attempts' });
     }
 
     const bytes = decodePhoto(photo);
@@ -641,6 +732,15 @@ app.post('/teacher-upload', async (req, res) => {
     if (membersError) throw membersError;
 
     if (!classMembers || classMembers.length === 0) {
+      const { data: cls, error: classErr } = await supabase
+        .from('classes')
+        .select('class_code')
+        .eq('class_code', classCode)
+        .maybeSingle();
+      if (classErr) throw classErr;
+      if (!cls) {
+        recordShortCodeIpNotFound(ip, now);
+      }
       return res.json({ matches: 0, totalFaces: 0, message: 'No families in this class yet' });
     }
 
@@ -832,61 +932,6 @@ app.post('/create-event', async (req, res) => {
   }
 });
 
-const JOIN_CLASS_WINDOW_MS = Number(process.env.JOIN_CLASS_WINDOW_MS) || 10 * 60 * 1000;
-const JOIN_CLASS_MAX_FAILURES_IP = Number(process.env.JOIN_CLASS_MAX_FAILURES_IP) || 20;
-const JOIN_CLASS_MAX_FAILURES_PARENT = Number(process.env.JOIN_CLASS_MAX_FAILURES_PARENT) || 5;
-const JOIN_CLASS_MAP_PRUNE_THRESHOLD = 1000;
-const joinClassFailuresByIp = new Map();
-const joinClassFailuresByParent = new Map();
-if (process.env.NODE_ENV === 'test') {
-  global.__getJoinClassFailureMapSizes = () => ({
-    ip: joinClassFailuresByIp.size,
-    parent: joinClassFailuresByParent.size,
-  });
-}
-
-function getClientIp(req) {
-  const realIp = req.headers && req.headers['x-real-ip'];
-  if (typeof realIp === 'string' && realIp.trim()) {
-    return realIp.split(',')[0].trim();
-  }
-  if (Array.isArray(realIp) && realIp.length && realIp[0].trim()) {
-    return realIp[0].split(',')[0].trim();
-  }
-  const remote = req.socket && req.socket.remoteAddress;
-  if (typeof remote === 'string' && remote.trim()) {
-    return remote.trim();
-  }
-  return null;
-}
-
-function pruneFailureMapIfNeeded(map, now) {
-  if (map.size > JOIN_CLASS_MAP_PRUNE_THRESHOLD) {
-    for (const [k, v] of map.entries()) {
-      if (!v || v.resetAt <= now) {
-        map.delete(k);
-      }
-    }
-  }
-}
-
-function isJoinClassThrottled(map, key, now, maxFailures) {
-  if (!key) return false;
-  const entry = map.get(key);
-  if (!entry || entry.resetAt <= now) return false;
-  return entry.count >= maxFailures;
-}
-
-function recordJoinClassFailure(map, key, now) {
-  if (!key) return;
-  let entry = map.get(key);
-  if (!entry || entry.resetAt <= now) {
-    entry = { count: 0, resetAt: now + JOIN_CLASS_WINDOW_MS };
-    map.set(key, entry);
-  }
-  entry.count += 1;
-}
-
 app.post('/join-class', async (req, res) => {
   try {
     const { classCode, parentId, childName } = req.body || {};
@@ -896,12 +941,10 @@ app.post('/join-class', async (req, res) => {
     if (!isValidParentId(parentId)) {
       return res.status(400).json({ error: 'invalid_parent_id' });
     }
-    const ip = getClientIp(req);
-    const now = Date.now();
-    pruneFailureMapIfNeeded(joinClassFailuresByIp, now);
+    const { ip, now, throttled: ipThrottled } = checkShortCodeIpThrottle(req);
     pruneFailureMapIfNeeded(joinClassFailuresByParent, now);
     if (
-      (ip !== null && isJoinClassThrottled(joinClassFailuresByIp, ip, now, JOIN_CLASS_MAX_FAILURES_IP)) ||
+      ipThrottled ||
       isJoinClassThrottled(joinClassFailuresByParent, parentId, now, JOIN_CLASS_MAX_FAILURES_PARENT)
     ) {
       return res.status(429).json({ error: 'too_many_attempts' });
@@ -914,9 +957,7 @@ app.post('/join-class', async (req, res) => {
       .maybeSingle();
     if (classError) throw classError;
     if (!cls) {
-      if (ip !== null) {
-        recordJoinClassFailure(joinClassFailuresByIp, ip, now);
-      }
+      recordShortCodeIpNotFound(ip, now);
       recordJoinClassFailure(joinClassFailuresByParent, parentId, now);
       return res.status(404).json({ error: 'class_not_found' });
     }
@@ -963,13 +1004,20 @@ app.post('/join-event', async (req, res) => {
     if (!eventCode) {
       return res.status(400).json({ error: 'eventCode and parentId are required' });
     }
+    const { ip, now, throttled } = checkShortCodeIpThrottle(req);
+    if (throttled) {
+      return res.status(429).json({ error: 'too_many_attempts' });
+    }
     const { data: event, error: eventError } = await supabase
       .from('events')
       .select('class_code, event_name')
       .eq('event_code', eventCode)
       .maybeSingle();
     if (eventError) throw eventError;
-    if (!event) return res.status(404).json({ error: 'Event not found' });
+    if (!event) {
+      recordShortCodeIpNotFound(ip, now);
+      return res.status(404).json({ error: 'Event not found' });
+    }
     await ensureClassMember(event.class_code, parentId);
     return res.json({ success: true, eventName: event.event_name, classCode: event.class_code });
   } catch (err) {
@@ -980,9 +1028,13 @@ app.post('/join-event', async (req, res) => {
 
 app.post('/event-upload', async (req, res) => {
   try {
-    const { eventCode, photo, parentId, requestId } = req.body;
+    const { eventCode, photo, parentId, requestId } = req.body || {};
     if (!eventCode || !photo || !parentId) {
       return res.status(400).json({ error: 'eventCode, photo, and parentId are required' });
+    }
+    const { ip, now, throttled } = checkShortCodeIpThrottle(req);
+    if (throttled) {
+      return res.status(429).json({ error: 'too_many_attempts' });
     }
 
     const bytes = decodePhoto(photo);
@@ -996,6 +1048,7 @@ app.post('/event-upload', async (req, res) => {
       .maybeSingle();
     if (eventError) throw eventError;
     if (!event) {
+      recordShortCodeIpNotFound(ip, now);
       return res.status(404).json({ error: 'Event not found' });
     }
 
@@ -1107,6 +1160,10 @@ app.post('/event-upload', async (req, res) => {
 
 app.get('/event-feed/:eventCode', async (req, res) => {
   try {
+    const { ip, now, throttled } = checkShortCodeIpThrottle(req);
+    if (throttled) {
+      return res.status(429).json({ error: 'too_many_attempts' });
+    }
     const { eventCode } = req.params;
 
     const { data: photos, error } = await supabase
@@ -1115,6 +1172,18 @@ app.get('/event-feed/:eventCode', async (req, res) => {
       .eq('event_code', eventCode)
       .order('created_at', { ascending: false });
     if (error) throw error;
+
+    if (!photos || photos.length === 0) {
+      const { data: event, error: eventError } = await supabase
+        .from('events')
+        .select('event_code')
+        .eq('event_code', eventCode)
+        .maybeSingle();
+      if (eventError) throw eventError;
+      if (!event) {
+        recordShortCodeIpNotFound(ip, now);
+      }
+    }
 
     const feed = (photos || []).map((photo) => {
       const url = photo.photo_url || '';
