@@ -8,3 +8,4 @@
   - `npm run lint`: `npx --yes eslint@8 -c .eslintrc.json index.js delete-parent.js test/`
   - `npm test`: `node --test test/` (discovers and runs all `*.test.js` files under `test/` via `test/index.js`)
   - `npm run check`: `npm run lint && npm test`
+- **Teacher 30-Day Class Pool & Retroactive Backfill (`devin/teacher-pool-backfill`):** see [`docs/teacher-pool-backfill.md`](docs/teacher-pool-backfill.md)
