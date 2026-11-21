@@ -16,6 +16,11 @@ const FACE_DETECT_MIN_CONFIDENCE = 90;
 const MAX_CROPPED_FACES = 20;
 const CROP_MARGIN_RATIO = 0.25;
 const CROP_MIN_SIZE = 160;
+const TEACHER_POOL_PREFIX = 'teacher-pool/';
+const TEACHER_POOL_RETENTION_DAYS = 30;
+const BACKFILL_WINDOW_MS = TEACHER_POOL_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const BACKFILL_MAX_PHOTOS = 50;
+const COMPARE_FACES_TARGET_LIMIT = 15;
 const RATE_LIMIT_MAX = 200;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
@@ -184,6 +189,305 @@ async function ensureCollection() {
   return collectionReady;
 }
 
+let teacherPoolLifecycleReady;
+async function ensureTeacherPoolLifecycle() {
+  if (!teacherPoolLifecycleReady) {
+    teacherPoolLifecycleReady = (async () => {
+      try {
+        if (typeof s3.putBucketLifecycleConfiguration !== 'function') return;
+        let existingRules = [];
+        if (typeof s3.getBucketLifecycleConfiguration === 'function') {
+          try {
+            const current = await s3.getBucketLifecycleConfiguration({ Bucket: S3_BUCKET }).promise();
+            existingRules = (current && current.Rules) || [];
+          } catch (err) {
+            if (err.code !== 'NoSuchLifecycleConfiguration') throw err;
+          }
+        }
+        const ruleId = 'expire-teacher-pool-30d';
+        const hasRule = existingRules.some((r) => r.ID === ruleId);
+        if (!hasRule) {
+          await s3
+            .putBucketLifecycleConfiguration({
+              Bucket: S3_BUCKET,
+              LifecycleConfiguration: {
+                Rules: [
+                  ...existingRules,
+                  {
+                    ID: ruleId,
+                    Filter: { Prefix: TEACHER_POOL_PREFIX },
+                    Status: 'Enabled',
+                    Expiration: { Days: TEACHER_POOL_RETENTION_DAYS },
+                  },
+                ],
+              },
+            })
+            .promise();
+        }
+      } catch (err) {
+        console.error('teacher-pool-lifecycle', err.message || err);
+      }
+    })();
+  }
+  return teacherPoolLifecycleReady;
+}
+
+const teacherBackfillState = new Map();
+let lastBackfillPromise = Promise.resolve();
+if (process.env.NODE_ENV === 'test') {
+  global.__waitForTeacherBackfill = () => lastBackfillPromise;
+  global.__getTeacherBackfillState = () => teacherBackfillState;
+}
+
+function extractPhotoHashFromKeyOrUrl(str) {
+  if (!str || typeof str !== 'string') return null;
+  const match = str.match(/\/([0-9a-f]{16})\.jpg(?:\?|$)/i);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function s3KeyFromPhotoUrl(url) {
+  const raw = String(url || '');
+  const bucketPrefix = `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/`;
+  return raw.startsWith(bucketPrefix) ? raw.replace(bucketPrefix, '') : raw;
+}
+
+async function listClassCandidatePhotos(classCode, nowMs = Date.now()) {
+  const cutoffMs = nowMs - BACKFILL_WINDOW_MS;
+  const byHash = new Map();
+
+  // Part B: S3 teacher-pool/${classCode}/<hash>.jpg objects within 30 days
+  if (typeof s3.listObjectsV2 === 'function') {
+    let continuationToken;
+    do {
+      const res = await s3
+        .listObjectsV2({
+          Bucket: S3_BUCKET,
+          Prefix: `${TEACHER_POOL_PREFIX}${classCode}/`,
+          ContinuationToken: continuationToken,
+        })
+        .promise();
+      for (const obj of (res && res.Contents) || []) {
+        const hash = extractPhotoHashFromKeyOrUrl(obj.Key);
+        const ts = obj.LastModified ? new Date(obj.LastModified).getTime() : nowMs;
+        if (hash && ts >= cutoffMs) {
+          byHash.set(hash, { hash, s3Key: obj.Key, timestampMs: ts });
+        }
+      }
+      continuationToken = res && res.IsTruncated ? res.NextContinuationToken : undefined;
+    } while (continuationToken);
+  }
+
+  // Part A: Earlier matched_photos rows in this class within 30 days
+  const cutoffIso = new Date(cutoffMs).toISOString();
+  const { data: matchedRows, error: matchedErr } = await supabase
+    .from('matched_photos')
+    .select('photo_url, matched_at')
+    .eq('class_code', classCode);
+  if (matchedErr) throw matchedErr;
+
+  for (const row of matchedRows || []) {
+    if (row.matched_at && row.matched_at < cutoffIso) continue;
+    const hash = extractPhotoHashFromKeyOrUrl(row.photo_url);
+    if (!hash || byHash.has(hash)) continue;
+    const s3Key = s3KeyFromPhotoUrl(row.photo_url);
+    const ts = row.matched_at ? new Date(row.matched_at).getTime() : nowMs;
+    if (ts >= cutoffMs) {
+      byHash.set(hash, { hash, s3Key, timestampMs: ts });
+    }
+  }
+
+  return [...byHash.values()]
+    .sort((a, b) => b.timestampMs - a.timestampMs)
+    .slice(0, BACKFILL_MAX_PHOTOS);
+}
+
+async function doesPhotoMatchReference(refKey, candidateS3Key, expectedExternalId) {
+  let compareRes;
+  try {
+    compareRes = await rekognition
+      .compareFaces({
+        SourceImage: { S3Object: { Bucket: S3_BUCKET, Name: refKey } },
+        TargetImage: { S3Object: { Bucket: S3_BUCKET, Name: candidateS3Key } },
+        SimilarityThreshold: FACE_MATCH_THRESHOLD,
+      })
+      .promise();
+  } catch (err) {
+    if (
+      err.code === 'InvalidParameterException' ||
+      err.code === 'InvalidS3ObjectException' ||
+      err.code === 'ResourceNotFoundException'
+    ) {
+      return false;
+    }
+    throw err;
+  }
+
+  const matched = (compareRes.FaceMatches || []).some(
+    (m) => (m.Similarity ?? 0) >= FACE_MATCH_THRESHOLD
+  );
+  if (matched) return true;
+
+  // Handle Rekognition's 15-face limit on CompareFaces target image:
+  // if >= 15 faces were in the target image, fall back to crop-based findMatchingFaces
+  const totalCompared =
+    (compareRes.FaceMatches ? compareRes.FaceMatches.length : 0) +
+    (compareRes.UnmatchedFaces ? compareRes.UnmatchedFaces.length : 0);
+  if (totalCompared >= COMPARE_FACES_TARGET_LIMIT && typeof s3.getObject === 'function') {
+    const obj = await s3.getObject({ Bucket: S3_BUCKET, Key: candidateS3Key }).promise();
+    const matchedExtIds = await findMatchingFaces(obj.Body);
+    return matchedExtIds.includes(expectedExternalId);
+  }
+
+  return false;
+}
+
+async function copyPoolPhotoToParentKey(sourceS3Key, destS3Key) {
+  if (typeof s3.copyObject === 'function') {
+    await s3
+      .copyObject({
+        Bucket: S3_BUCKET,
+        CopySource: `${S3_BUCKET}/${sourceS3Key}`,
+        Key: destS3Key,
+        ContentType: 'image/jpeg',
+      })
+      .promise();
+    return publicS3Url(destS3Key);
+  }
+  if (typeof s3.getObject === 'function') {
+    const obj = await s3.getObject({ Bucket: S3_BUCKET, Key: sourceS3Key }).promise();
+    return uploadJpeg(destS3Key, obj.Body);
+  }
+  return publicS3Url(destS3Key);
+}
+
+async function backfillClassPhotosForParent(classCode, parentId) {
+  if (!classCode || !parentId) return { matched: 0, checked: 0 };
+
+  const targets = [
+    {
+      childId: null,
+      faceKey: rekognitionImageId(parentId),
+      refKey: `references/${rekognitionImageId(parentId)}.jpg`,
+    },
+  ];
+
+  if (MULTI_CHILD_ENABLED) {
+    const { data: childrenRows, error: childErr } = await supabase
+      .from('children')
+      .select('child_id')
+      .eq('parent_id', parentId);
+    if (childErr) throw childErr;
+    for (const c of childrenRows || []) {
+      if (c.child_id) {
+        targets.push({
+          childId: c.child_id,
+          faceKey: rekognitionImageId(c.child_id),
+          refKey: `references/${rekognitionImageId(c.child_id)}.jpg`,
+        });
+      }
+    }
+  }
+
+  const pendingTargets = targets.filter(
+    (t) => teacherBackfillState.get(`${classCode}:${parentId}:${t.faceKey}`) !== 'done'
+  );
+  if (pendingTargets.length === 0) {
+    return { matched: 0, checked: 0, skippedDone: true };
+  }
+
+  for (const t of pendingTargets) {
+    const stateKey = `${classCode}:${parentId}:${t.faceKey}`;
+    if (teacherBackfillState.get(stateKey) === 'running') {
+      return { matched: 0, checked: 0, running: true };
+    }
+    teacherBackfillState.set(stateKey, 'running');
+  }
+
+  try {
+    const candidates = await listClassCandidatePhotos(classCode);
+    const { data: existingRows, error: existingErr } = await supabase
+      .from('matched_photos')
+      .select('photo_url' + (MULTI_CHILD_ENABLED ? ', child_id' : ''))
+      .eq('parent_id', parentId)
+      .eq('class_code', classCode);
+    if (existingErr) throw existingErr;
+
+    const existingHashesByTarget = new Map();
+    for (const t of pendingTargets) {
+      existingHashesByTarget.set(t.faceKey, new Set());
+    }
+    for (const row of existingRows || []) {
+      const h = extractPhotoHashFromKeyOrUrl(row.photo_url);
+      if (!h) continue;
+      for (const t of pendingTargets) {
+        if (!MULTI_CHILD_ENABLED || !t.childId || row.child_id === t.childId) {
+          existingHashesByTarget.get(t.faceKey).add(h);
+        }
+      }
+    }
+
+    let matched = 0;
+    let checked = 0;
+    for (const candidate of candidates) {
+      for (const t of pendingTargets) {
+        const knownHashes = existingHashesByTarget.get(t.faceKey);
+        if (knownHashes.has(candidate.hash)) continue;
+        checked += 1;
+
+        const isMatch = await doesPhotoMatchReference(t.refKey, candidate.s3Key, t.faceKey);
+        if (!isMatch) continue;
+
+        const destKey = `teacher-photos/${classCode}/${parentId}/${candidate.hash}.jpg`;
+        const photoUrl = await copyPoolPhotoToParentKey(candidate.s3Key, destKey);
+
+        // Dedupe check right before inserting
+        const { data: dupRows, error: dupErr } = await supabase
+          .from('matched_photos')
+          .select('photo_url' + (MULTI_CHILD_ENABLED ? ', child_id' : ''))
+          .eq('parent_id', parentId)
+          .eq('class_code', classCode)
+          .eq('photo_url', photoUrl);
+        if (dupErr) throw dupErr;
+        const alreadyInserted = (dupRows || []).some((r) =>
+          MULTI_CHILD_ENABLED && t.childId ? r.child_id === t.childId : true
+        );
+        if (!alreadyInserted) {
+          const insertRow = {
+            parent_id: parentId,
+            photo_url: photoUrl,
+            class_code: classCode,
+            matched_at: new Date().toISOString(),
+          };
+          if (MULTI_CHILD_ENABLED && t.childId) insertRow.child_id = t.childId;
+          const { error: insertErr } = await supabase.from('matched_photos').insert(insertRow);
+          if (insertErr) throw insertErr;
+          matched += 1;
+        }
+        knownHashes.add(candidate.hash);
+      }
+    }
+
+    for (const t of pendingTargets) {
+      teacherBackfillState.set(`${classCode}:${parentId}:${t.faceKey}`, 'done');
+    }
+    return { matched, checked };
+  } catch (err) {
+    for (const t of pendingTargets) {
+      teacherBackfillState.delete(`${classCode}:${parentId}:${t.faceKey}`);
+    }
+    throw err;
+  }
+}
+
+function triggerClassBackfillInBackground(classCode, parentId) {
+  lastBackfillPromise = lastBackfillPromise
+    .catch(() => {})
+    .then(() => backfillClassPhotosForParent(classCode, parentId))
+    .catch((err) => {
+      console.error('teacher-backfill', err);
+    });
+}
+
 function generateGrandmaCode() {
   return String(crypto.randomInt(0, 10000)).padStart(4, '0');
 }
@@ -224,6 +528,25 @@ app.post('/save-reference', async (req, res) => {
       .promise();
 
     await uploadJpeg(`references/${faceKey}.jpg`, bytes);
+
+    if (parentId) {
+      // Clear any previous backfill completion markers for this parent/faceKey and backfill their classes in background
+      for (const k of teacherBackfillState.keys()) {
+        if (k.includes(`:${parentId}:`)) teacherBackfillState.delete(k);
+      }
+      supabase
+        .from('class_members')
+        .select('class_code')
+        .eq('parent_id', parentId)
+        .then(({ data: memberships }) => {
+          const codes = [...new Set((memberships || []).map((m) => m.class_code).filter(Boolean))];
+          for (const code of codes) {
+            triggerClassBackfillInBackground(code, parentId);
+          }
+        })
+        .catch((err) => console.error('save-reference-backfill', err));
+    }
+
     return res.json({ success: true });
   } catch (err) {
     console.error('save-reference', err);
@@ -722,7 +1045,10 @@ app.post('/teacher-upload', async (req, res) => {
     }
 
     const bytes = decodePhoto(photo);
+    const hash = crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 16);
+    const poolKey = `${TEACHER_POOL_PREFIX}${classCode}/${hash}.jpg`;
     await ensureCollection();
+    await ensureTeacherPoolLifecycle();
 
     // Get all families in this class
     const { data: classMembers, error: membersError } = await supabase
@@ -740,9 +1066,13 @@ app.post('/teacher-upload', async (req, res) => {
       if (classErr) throw classErr;
       if (!cls) {
         recordShortCodeIpNotFound(ip, now);
+        return res.json({ matches: 0, totalFaces: 0, message: 'No families in this class yet' });
       }
+      await uploadJpeg(poolKey, bytes);
       return res.json({ matches: 0, totalFaces: 0, message: 'No families in this class yet' });
     }
+
+    await uploadJpeg(poolKey, bytes);
 
     // Run face recognition
     let matchedExtIds;
@@ -775,7 +1105,6 @@ app.post('/teacher-upload', async (req, res) => {
       // Check if this parent is in the class and not already routed for this photo
       if (parentIdsInClass.has(ownerParentId) && !seenRecipients.has(recipientKey)) {
         seenRecipients.add(recipientKey);
-        const hash = crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 16);
         const key = `teacher-photos/${classCode}/${ownerParentId}/${hash}.jpg`;
         const photoUrl = await uploadJpeg(key, bytes);
 
@@ -987,6 +1316,7 @@ app.post('/join-class', async (req, res) => {
         .insert({ class_code: classCode, parent_id: parentId, child_name: resolvedChildName });
       if (insertError && insertError.code !== '23505') throw insertError;
     }
+    triggerClassBackfillInBackground(classCode, parentId);
     console.log(`[join-class] classCode=${classCode} parentId=${parentId}`);
     return res.status(200).json({ joined: true });
   } catch (err) {
