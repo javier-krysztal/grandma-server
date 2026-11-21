@@ -685,25 +685,45 @@ app.post('/grandma-heart', async (req, res) => {
   }
 });
 
+function generateFourDigitCode() {
+  return String(crypto.randomInt(0, 10000)).padStart(4, '0');
+}
+
 // Teacher mode endpoints
 app.post('/create-class', async (req, res) => {
   try {
-    const { teacherName, classCode } = req.body;
-    if (!teacherName || !classCode) {
+    const { teacherName, classCode } = req.body || {};
+    if (!teacherName) {
       return res.status(400).json({ error: 'teacherName and classCode are required' });
     }
-    if (classCode.length !== 4) {
+    if (classCode !== undefined && classCode !== null && String(classCode).length !== 4) {
       return res.status(400).json({ error: 'classCode must be 4 digits' });
     }
 
-    const { data, error } = await supabase
-      .from('classes')
-      .insert({ class_code: classCode, teacher_name: teacherName })
-      .select()
-      .single();
-    if (error) throw error;
+    let candidateCode = classCode ? String(classCode) : generateFourDigitCode();
+    let createdClass = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const { data, error } = await supabase
+        .from('classes')
+        .insert({ class_code: candidateCode, teacher_name: teacherName })
+        .select()
+        .single();
+      if (!error) {
+        createdClass = data;
+        break;
+      }
+      if (error.code === '23505') {
+        candidateCode = generateFourDigitCode();
+        continue;
+      }
+      throw error;
+    }
 
-    return res.json({ success: true, class: data });
+    if (!createdClass) {
+      return res.status(500).json({ error: 'Could not generate a unique class code, please try again' });
+    }
+
+    return res.json({ success: true, class: createdClass, classCode: createdClass.class_code });
   } catch (err) {
     console.error('create-class', err);
     return res.status(err.status || 500).json({ error: err.message || 'Failed to create class' });
@@ -894,38 +914,43 @@ app.post('/create-event', async (req, res) => {
 
     await ensureClassMember(classCode, parentId);
 
-    // Generate unique 4-digit event code
-    let eventCode;
-    for (let i = 0; i < 10; i++) {
-      const code = String(crypto.randomInt(0, 10000)).padStart(4, '0');
-      const { data, error } = await supabase
+    // Generate unique 4-digit event code and retry on 23505 unique-constraint collision up to 10 times
+    let createdEvent = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const candidateCode = generateFourDigitCode();
+      const { data: existingCode, error: checkErr } = await supabase
         .from('events')
         .select('event_code')
-        .eq('event_code', code)
+        .eq('event_code', candidateCode)
         .maybeSingle();
-      if (error) throw error;
-      if (!data) {
-        eventCode = code;
+      if (checkErr) throw checkErr;
+      if (existingCode) continue;
+
+      const { data, error } = await supabase
+        .from('events')
+        .insert({
+          event_code: candidateCode,
+          event_name: eventName,
+          class_code: classCode,
+          created_by: parentId,
+        })
+        .select('event_code, event_name, class_code, created_by, created_at')
+        .single();
+      if (!error) {
+        createdEvent = data;
         break;
       }
-    }
-    if (!eventCode) {
-      return res.status(500).json({ error: 'server_error' });
+      if (error.code === '23505') {
+        continue;
+      }
+      throw error;
     }
 
-    const { data, error } = await supabase
-      .from('events')
-      .insert({
-        event_code: eventCode,
-        event_name: eventName,
-        class_code: classCode,
-        created_by: parentId,
-      })
-      .select('event_code, event_name, class_code, created_by, created_at')
-      .single();
-    if (error) throw error;
+    if (!createdEvent) {
+      return res.status(500).json({ error: 'Could not generate a unique event code, please try again' });
+    }
 
-    return res.json({ success: true, event: data });
+    return res.json({ success: true, event: createdEvent });
   } catch (err) {
     console.error('create-event', err);
     return res.status(500).json({ error: 'server_error' });

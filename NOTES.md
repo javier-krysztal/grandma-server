@@ -8,3 +8,4 @@
   - `npm run lint`: `npx --yes eslint@8 -c .eslintrc.json index.js delete-parent.js test/`
   - `npm test`: `node --test test/` (discovers and runs all `*.test.js` files under `test/` via `test/index.js`)
   - `npm run check`: `npm run lint && npm test`
+- **Unique 4-Digit Code Retry on `23505` in `/create-class` and `/create-event` (`devin/create-class-event-retry`):** Retries up to 10 times with a newly generated 4-digit code on Postgres `23505` unique-constraint collision in both `POST /create-class` and `POST /create-event`, returning a clear error message if all 10 attempts collide (tested in `test/create-class-event-retry.test.js`).
